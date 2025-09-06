@@ -4,13 +4,20 @@ Test metric implementations against sklearn baselines.
 
 import sys
 import numpy as np
-import torch
 from pathlib import Path
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from src.utils.metrics import IoUMetric, DiceMetric, F1Metric, PixelAccuracyMetric, compute_metrics
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("PyTorch not available - running limited tests")
+
+if TORCH_AVAILABLE:
+    from src.utils.metrics import IoUMetric, DiceMetric, F1Metric, PixelAccuracyMetric, compute_metrics
 
 
 def create_test_data():
@@ -52,7 +59,7 @@ def test_iou_metric():
     assert results['foreground_iou'] > 0.2, f"Foreground IoU too low: {results['foreground_iou']}"
     
     print("✓ IoU metric test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_dice_metric():
@@ -74,7 +81,7 @@ def test_dice_metric():
     assert 0 <= results['foreground_dice'] <= 1, f"Invalid foreground Dice: {results['foreground_dice']}"
     
     print("✓ Dice metric test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_f1_metric():
@@ -98,7 +105,7 @@ def test_f1_metric():
     assert 0 <= results['recall'] <= 1, f"Invalid recall: {results['recall']}"
     
     print("✓ F1 metric test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_pixel_accuracy():
@@ -119,7 +126,7 @@ def test_pixel_accuracy():
     assert accuracy > 0.4, f"Accuracy too low: {accuracy}"  # Should be decent for our test case
     
     print("✓ Pixel accuracy test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_perfect_predictions():
@@ -148,7 +155,7 @@ def test_perfect_predictions():
     assert results['pixel_accuracy'] > 0.99, f"Perfect accuracy too low: {results['pixel_accuracy']}"
     
     print("✓ Perfect predictions test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_worst_predictions():
@@ -177,7 +184,7 @@ def test_worst_predictions():
     assert results['pixel_accuracy'] < 0.1, f"Worst accuracy too high: {results['pixel_accuracy']}"
     
     print("✓ Worst predictions test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_binary_case():
@@ -203,7 +210,7 @@ def test_binary_case():
     assert results['pixel_accuracy'] > 0.4, f"Binary accuracy too low: {results['pixel_accuracy']}"
     
     print("✓ Binary predictions test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_metric_consistency():
@@ -234,12 +241,118 @@ def test_metric_consistency():
     assert diff < 1e-6, f"Inconsistent IoU computation: {diff}"
     
     print("✓ Metric consistency test passed!")
-    return True
+    assert True  # Test passed
+
+
+def test_multiclass_metrics():
+    """Test metrics with multiple classes."""
+    if not TORCH_AVAILABLE:
+        print("Skipping multi-class test - PyTorch not available")
+        assert True  # Test passed
+        
+    print("Testing multi-class metrics (3 classes)...")
+    
+    from src.utils.metrics import MetricCollection
+    
+    # Create 3-class data: PASS (0), defect_1 (1), defect_2 (2)
+    batch_size, height, width = 2, 64, 64
+    num_classes = 3
+    
+    # Create structured predictions
+    predictions = torch.zeros(batch_size, num_classes, height, width)
+    
+    # First image: mostly PASS with some defect_1
+    predictions[0, 0, :40, :] = 3.0    # PASS region (strong logit)
+    predictions[0, 1, 40:50, :] = 2.5  # defect_1 region
+    predictions[0, 2, 50:, :] = 1.0    # weak defect_2 signal
+    
+    # Second image: mixed defects
+    predictions[1, 0, :20, :] = 2.0    # PASS region
+    predictions[1, 1, 20:40, :] = 1.5  # defect_1 region
+    predictions[1, 2, 40:, :] = 3.0    # defect_2 region (strong)
+    
+    # Create corresponding targets
+    targets = torch.zeros(batch_size, height, width, dtype=torch.long)
+    
+    # First image targets
+    targets[0, :40, :] = 0      # PASS
+    targets[0, 40:50, :] = 1    # defect_1
+    targets[0, 50:, :] = 2      # defect_2
+    
+    # Second image targets
+    targets[1, :20, :] = 0      # PASS
+    targets[1, 20:40, :] = 1    # defect_1
+    targets[1, 40:, :] = 2      # defect_2
+    
+    # Compute metrics
+    metric_collection = MetricCollection(num_classes=3)
+    metric_collection.update(predictions, targets)
+    results = metric_collection.compute()
+    
+    # Verify we get per-class metrics
+    for class_idx in range(num_classes):
+        assert f'iou_class_{class_idx}_iou' in results
+        assert f'dice_class_{class_idx}_dice' in results
+        assert f'f1_class_{class_idx}_f1' in results
+        
+        # All metrics should be perfect since we designed the test data to match
+        assert results[f'iou_class_{class_idx}_iou'] == 1.0
+        assert results[f'dice_class_{class_idx}_dice'] == 1.0
+        assert results[f'f1_class_{class_idx}_f1'] >= 0.99  # Allow slight numerical precision
+    
+    # Check mean metrics
+    assert results['iou_mean_iou'] == 1.0
+    assert results['dice_mean_dice'] == 1.0
+    assert results['f1_mean_f1'] >= 0.99
+    
+    print("✓ Multi-class metrics test passed!")
+    assert True  # Test passed
+
+
+def test_configurable_classes():
+    """Test that metrics work with different numbers of classes."""
+    if not TORCH_AVAILABLE:
+        print("Skipping configurable classes test - PyTorch not available")
+        assert True  # Test passed
+        
+    print("Testing configurable number of classes...")
+    
+    from src.utils.metrics import MetricCollection
+    
+    # Test different numbers of classes
+    for num_classes in [2, 3, 5]:
+        # Create random but valid data
+        batch_size, height, width = 2, 32, 32
+        predictions = torch.randn(batch_size, num_classes, height, width)
+        targets = torch.randint(0, num_classes, (batch_size, height, width))
+        
+        # Compute metrics
+        metric_collection = MetricCollection(num_classes=num_classes)
+        metric_collection.update(predictions, targets)
+        results = metric_collection.compute()
+        
+        # Verify we get the right number of class-specific metrics
+        class_iou_keys = [k for k in results.keys() if k.startswith('iou_class_')]
+        assert len(class_iou_keys) == num_classes, f"Expected {num_classes} class IoU metrics, got {len(class_iou_keys)}"
+        
+        # Verify mean metrics exist
+        assert 'iou_mean_iou' in results
+        assert 'dice_mean_dice' in results
+        assert 'f1_mean_f1' in results
+        
+        print(f"  ✓ {num_classes} classes: Mean IoU = {results['iou_mean_iou']:.4f}")
+    
+    print("✓ Configurable classes test passed!")
+    assert True  # Test passed
 
 
 def run_all_tests():
     """Run all metric tests."""
     print("Running metric tests...\n")
+    
+    if not TORCH_AVAILABLE:
+        print("PyTorch not available - running limited tests")
+        assert True  # Test passed
     
     tests = [
         test_iou_metric,
@@ -249,7 +362,9 @@ def run_all_tests():
         test_perfect_predictions,
         test_worst_predictions,
         test_binary_case,
-        test_metric_consistency
+        test_metric_consistency,
+        test_multiclass_metrics,
+        test_configurable_classes
     ]
     
     passed = 0

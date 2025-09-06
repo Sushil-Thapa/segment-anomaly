@@ -85,11 +85,16 @@ class IoUMetric:
         valid_classes = self.union > 0
         mean_iou = iou_per_class[valid_classes].mean().item()
         
-        results = {
-            'mean_iou': mean_iou,
-            'background_iou': iou_per_class[0].item(),
-            'foreground_iou': iou_per_class[1].item() if self.num_classes > 1 else 0.0
-        }
+        results = {'mean_iou': mean_iou}
+        
+        # Add per-class IoU scores
+        for class_idx in range(self.num_classes):
+            results[f'class_{class_idx}_iou'] = iou_per_class[class_idx].item()
+        
+        # Keep backward compatibility for binary case
+        if self.num_classes == 2:
+            results['background_iou'] = iou_per_class[0].item()
+            results['foreground_iou'] = iou_per_class[1].item()
         
         return results
 
@@ -171,11 +176,16 @@ class DiceMetric:
         valid_classes = self.total > 0
         mean_dice = dice_per_class[valid_classes].mean().item()
         
-        results = {
-            'mean_dice': mean_dice,
-            'background_dice': dice_per_class[0].item(),
-            'foreground_dice': dice_per_class[1].item() if self.num_classes > 1 else 0.0
-        }
+        results = {'mean_dice': mean_dice}
+        
+        # Add per-class Dice scores
+        for class_idx in range(self.num_classes):
+            results[f'class_{class_idx}_dice'] = dice_per_class[class_idx].item()
+        
+        # Keep backward compatibility for binary case
+        if self.num_classes == 2:
+            results['background_dice'] = dice_per_class[0].item()
+            results['foreground_dice'] = dice_per_class[1].item()
         
         return results
 
@@ -275,13 +285,20 @@ class F1Metric:
             weights = support / support.sum()
             mean_f1 = (f1 * weights).sum().item()
         
-        results = {
-            'mean_f1': mean_f1,
-            'background_f1': f1[0].item(),
-            'foreground_f1': f1[1].item() if self.num_classes > 1 else 0.0,
-            'precision': precision[1].item() if self.num_classes > 1 else precision[0].item(),
-            'recall': recall[1].item() if self.num_classes > 1 else recall[0].item()
-        }
+        results = {'mean_f1': mean_f1}
+        
+        # Add per-class F1, precision, recall
+        for class_idx in range(self.num_classes):
+            results[f'class_{class_idx}_f1'] = f1[class_idx].item()
+            results[f'class_{class_idx}_precision'] = precision[class_idx].item()
+            results[f'class_{class_idx}_recall'] = recall[class_idx].item()
+        
+        # Keep backward compatibility for binary case
+        if self.num_classes == 2:
+            results['background_f1'] = f1[0].item()
+            results['foreground_f1'] = f1[1].item()
+            results['precision'] = precision[1].item()  # Positive class precision
+            results['recall'] = recall[1].item()        # Positive class recall
         
         return results
 

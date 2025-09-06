@@ -198,19 +198,64 @@ class TileStitcher:
             # Accumulate weighted predictions
             if num_classes is not None:
                 for c in range(num_classes):
+                    # Get the tile slice and output slice
+                    tile_slice = tile_crop[:, :, c]
+                    output_slice = output[place_start_y:place_end_y, place_start_x:place_end_x, c]
+                    
+                    # Both tile_slice and weights need to match output_slice shape
+                    if tile_slice.shape != output_slice.shape:
+                        tile_slice = np.resize(tile_slice, output_slice.shape)
+                    
+                    if weights.shape != output_slice.shape:
+                        weights_resized = np.resize(weights, output_slice.shape)
+                    else:
+                        weights_resized = weights
+                    
                     output[place_start_y:place_end_y, place_start_x:place_end_x, c] += \
-                        tile_crop[:, :, c] * weights
+                        tile_slice * weights_resized
             else:
                 if len(tile.shape) == 3:
                     for c in range(tile.shape[2]):
+                        # Get the tile slice and output slice
+                        tile_slice = tile_crop[:, :, c]
+                        output_slice = output[place_start_y:place_end_y, place_start_x:place_end_x, c]
+                        
+                        # Both tile_slice and weights need to match output_slice shape
+                        if tile_slice.shape != output_slice.shape:
+                            tile_slice = np.resize(tile_slice, output_slice.shape)
+                        
+                        if weights.shape != output_slice.shape:
+                            weights_resized = np.resize(weights, output_slice.shape)
+                        else:
+                            weights_resized = weights
+                        
                         output[place_start_y:place_end_y, place_start_x:place_end_x, c] += \
-                            tile_crop[:, :, c] * weights
+                            tile_slice * weights_resized
                 else:
+                    # 2D case
+                    output_slice = output[place_start_y:place_end_y, place_start_x:place_end_x]
+                    
+                    if tile_crop.shape != output_slice.shape:
+                        tile_crop = np.resize(tile_crop, output_slice.shape)
+                    
+                    if weights.shape != output_slice.shape:
+                        weights_resized = np.resize(weights, output_slice.shape)
+                    else:
+                        weights_resized = weights
+                    
                     output[place_start_y:place_end_y, place_start_x:place_end_x] += \
-                        tile_crop * weights
+                        tile_crop * weights_resized
             
             # Accumulate weights
-            weight_sum[place_start_y:place_end_y, place_start_x:place_end_x] += weights
+            target_h = place_end_y - place_start_y
+            target_w = place_end_x - place_start_x
+            weight_slice = weight_sum[place_start_y:place_end_y, place_start_x:place_end_x]
+            
+            if weights.shape != weight_slice.shape:
+                weights_for_sum = np.resize(weights, weight_slice.shape)
+            else:
+                weights_for_sum = weights
+            weight_sum[place_start_y:place_end_y, place_start_x:place_end_x] += weights_for_sum
         
         # Normalize by weight sum
         weight_sum = np.maximum(weight_sum, 1e-8)  # Avoid division by zero

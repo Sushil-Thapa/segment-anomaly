@@ -1,13 +1,13 @@
 # Swin-UNet Wafer Defect Segmentation
 
-A production-ready PyTorch implementation for binary wafer defect segmentation using Swin Transformer backbone with UNet decoder.
+PyTorch implementation for wafer defect segmentation using Swin Transformer backbone with UNet decoder. Supports both binary and multi-class segmentation.
 
 ## 🏗️ Architecture
 
 - **Backbone**: Swin-Large (swin_large_patch4_window12_384) from timm
 - **Decoder**: UNet with skip connections and attention gates
 - **Input**: 512×512 tiles with 50% overlap (256 stride)
-- **Output**: Binary segmentation masks (defect/no-defect)
+- **Output**: Configurable segmentation masks (binary or multi-class)
 
 ## 📦 Installation
 
@@ -16,11 +16,15 @@ A production-ready PyTorch implementation for binary wafer defect segmentation u
 git clone <repository-url>
 cd segment-anomaly
 
-# Install dependencies
+# Setup with uv (recommended)
+./setup.sh  # Mac/Linux
+# OR setup.bat  # Windows
+
+# Or use pip
 pip install -r requirements.txt
 
 # Verify installation
-python tests/run_tests.py
+uv run python tests/run_tests.py
 ```
 
 ## 📁 Data Structure
@@ -45,8 +49,11 @@ data/
 ```
 
 **Requirements:**
+
 - Images: RGB wafer images (any size, will be tiled)
-- Masks: Binary masks (0=background, 255=defect)
+- Masks: Grayscale masks with class indices
+  - Binary: 0=background, 1=defect
+  - Multi-class: 0=background, 1=defect_type1, 2=defect_type2, etc.
 - Matching filenames between images and masks
 
 ## 🚀 Quick Start

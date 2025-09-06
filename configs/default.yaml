@@ -9,6 +9,7 @@ data:
 model:
   backbone: swin_large_patch4_window12_384
   decoder_channels: [1024, 512, 256, 128, 64]
+  num_classes: 2  # Change to 3+ for multi-class segmentation (0=background, 1=defect1, 2=defect2, etc.)
   dropout: 0.1
   
 training:

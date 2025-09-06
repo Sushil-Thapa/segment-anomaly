@@ -5,7 +5,7 @@ Main trainer class for segmentation model training.
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import numpy as np
 import time
 from pathlib import Path
@@ -67,8 +67,23 @@ class Trainer:
         self.best_metric = float('inf') if config['callbacks']['early_stopping']['mode'] == 'min' else -float('inf')
         
         # Mixed precision training
-        self.use_amp = config.get('use_amp', True)
-        self.scaler = GradScaler() if self.use_amp else None
+        requested_amp = config.get('use_amp', True)
+        
+        # Disable AMP for MPS devices as it's not fully supported yet
+        if self.device.type == 'mps' and requested_amp:
+            print("Warning: Mixed precision training not fully supported on MPS devices, disabling AMP")
+            self.use_amp = False
+        else:
+            self.use_amp = requested_amp
+        
+        # Initialize GradScaler with device-specific backend
+        if self.use_amp:
+            if self.device.type == 'cuda':
+                self.scaler = GradScaler('cuda')
+            else:
+                self.scaler = GradScaler('cpu')
+        else:
+            self.scaler = None
         
         # Gradient accumulation
         self.accumulate_grad_steps = config['training'].get('accumulate_grad', 1)
@@ -163,7 +178,7 @@ class Trainer:
             
             # Forward pass with mixed precision
             if self.use_amp:
-                with autocast():
+                with autocast(self.device.type):
                     outputs = self.model(images)
                     loss_dict = self.criterion(outputs, targets)
                     loss = loss_dict['total_loss'] / self.accumulate_grad_steps
@@ -258,7 +273,7 @@ class Trainer:
                 
                 # Forward pass
                 if self.use_amp:
-                    with autocast():
+                    with autocast(self.device.type):
                         outputs = self.model(images)
                         loss_dict = self.criterion(outputs, targets)
                 else:

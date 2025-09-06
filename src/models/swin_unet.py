@@ -49,14 +49,15 @@ class SwinUNet(nn.Module):
             backbone_name,
             pretrained=pretrained,
             features_only=True,
-            out_indices=(0, 1, 2, 3, 4)  # Get features from all stages
+            out_indices=(0, 1, 2, 3)  # Get features from all stages (Swin has 4 stages)
         )
         
         # Get feature information from backbone
         with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 384, 384)  # Standard Swin input size
+            dummy_input = torch.randn(1, 3, 224, 224)  # Match Swin input size
             features = self.backbone(dummy_input)
-            feature_channels = [f.shape[1] for f in features]
+            # Swin transformer outputs are in NHWC format
+            feature_channels = [f.shape[-1] for f in features]
         
         print(f"Backbone feature channels: {feature_channels}")
         
@@ -112,6 +113,9 @@ class SwinUNet(nn.Module):
         
         # Extract features using backbone
         features = self.backbone(x)
+        
+        # Convert from NHWC to NCHW format for CNN decoder
+        features = [f.permute(0, 3, 1, 2).contiguous() for f in features]
         
         # Decode features
         decoder_output = self.decoder(features)

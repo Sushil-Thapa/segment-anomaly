@@ -1,6 +1,394 @@
+#!/usr/bin/env python3
 """
-Main training script for wafer defect segmentation.
+Main training script for Swin-UNet wafer defect segmentation.
 """
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from omegaconf import OmegaConf
+
+# Add src to path
+sys.path.append(str(Path(__file__).parent / 'src'))
+
+from data.dataset import WaferTileDataset
+from data.transforms import get_train_transforms, get_val_transforms
+from losses.combined import CombinedLoss, HardNegativeMiningLoss
+from models.swin_unet import create_model
+from training.callbacks import EarlyStopping, ModelCheckpoint, VisualizePredictions
+from training.trainer import Trainer
+from utils.distributed import setup_ddp, cleanup_ddp, is_main_process
+from utils.metrics import MetricCollection
+from utils.system_info import get_recommended_settings, detect_gpu, print_system_info
+
+
+def setup_logging(log_level: str = 'INFO'):
+    """Setup logging configuration."""
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler('logs/training.log', mode='a')
+        ]
+    )
+    
+    # Create logs directory
+    Path('logs').mkdir(exist_ok=True)
+
+
+def create_optimizer(model, config):
+    """Create optimizer with different learning rates for backbone and decoder."""
+    # Get recommended settings
+    settings = get_recommended_settings()
+    
+    # Separate backbone and decoder parameters
+    backbone_params = []
+    decoder_params = []
+    
+    for name, param in model.named_parameters():
+        if 'backbone' in name:
+            backbone_params.append(param)
+        else:
+            decoder_params.append(param)
+    
+    # Create parameter groups with different learning rates
+    param_groups = [
+        {
+            'params': backbone_params, 
+            'lr': config.optimizer.lr * config.optimizer.backbone_lr_ratio,
+            'name': 'backbone'
+        },
+        {
+            'params': decoder_params, 
+            'lr': config.optimizer.lr,
+            'name': 'decoder'
+        }
+    ]
+    
+    if config.optimizer.name.lower() == 'adamw':
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=config.optimizer.lr,
+            weight_decay=config.optimizer.weight_decay,
+            betas=(config.optimizer.beta1, config.optimizer.beta2),
+            eps=config.optimizer.eps
+        )
+    elif config.optimizer.name.lower() == 'adam':
+        optimizer = torch.optim.Adam(
+            param_groups,
+            lr=config.optimizer.lr,
+            weight_decay=config.optimizer.weight_decay,
+            betas=(config.optimizer.beta1, config.optimizer.beta2),
+            eps=config.optimizer.eps
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {config.optimizer.name}")
+    
+    return optimizer
+
+
+def create_scheduler(optimizer, config, steps_per_epoch):
+    """Create learning rate scheduler."""
+    if config.scheduler.name.lower() == 'cosineannealinglr':
+        # Calculate total steps
+        total_steps = steps_per_epoch * config.training.num_epochs
+        warmup_steps = steps_per_epoch * config.scheduler.warmup_epochs
+        
+        # Create scheduler with warmup
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps - warmup_steps,
+            eta_min=config.scheduler.min_lr
+        )
+        
+        # Wrap with warmup
+        if warmup_steps > 0:
+            from torch.optim.lr_scheduler import LambdaLR
+            
+            def warmup_lambda(current_step):
+                if current_step < warmup_steps:
+                    return current_step / warmup_steps
+                return 1.0
+            
+            warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+            return warmup_scheduler, scheduler
+        
+        return scheduler, None
+        
+    elif config.scheduler.name.lower() == 'steplr':
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=config.scheduler.step_size,
+            gamma=config.scheduler.gamma
+        )
+        return scheduler, None
+    else:
+        raise ValueError(f"Unsupported scheduler: {config.scheduler.name}")
+
+
+def train_worker(rank, world_size, config, args):
+    """Training worker function for distributed training."""
+    # Setup distributed training
+    if args.distributed:
+        setup_ddp(rank, world_size)
+    
+    # Get device and recommended settings
+    settings = get_recommended_settings()
+    
+    if args.distributed:
+        device = torch.device(f'cuda:{rank}')
+    else:
+        device = settings['device']
+    
+    # Override config with system recommendations if not explicitly set
+    if not hasattr(config.training, 'mixed_precision'):
+        config.training.mixed_precision = settings['mixed_precision']
+    
+    # Setup logging
+    if is_main_process():
+        setup_logging(config.logging.level)
+        logger = logging.getLogger(__name__)
+        logger.info("Starting Swin-UNet training")
+        print_system_info()
+    
+    # Create datasets
+    train_transforms = get_train_transforms(config.data.tile_size)
+    val_transforms = get_val_transforms(config.data.tile_size)
+    
+    train_dataset = WaferTileDataset(
+        data_dir=Path(config.data.data_dir) / 'train',
+        tile_size=config.data.tile_size,
+        stride=config.data.stride,
+        transforms=train_transforms,
+        cache_tiles=config.data.cache_tiles
+    )
+    
+    val_dataset = WaferTileDataset(
+        data_dir=Path(config.data.data_dir) / 'val',
+        tile_size=config.data.tile_size,
+        stride=config.data.stride,
+        transforms=val_transforms,
+        cache_tiles=False
+    )
+    
+    if is_main_process():
+        logger.info(f"Train dataset: {len(train_dataset)} samples")
+        logger.info(f"Val dataset: {len(val_dataset)} samples")
+    
+    # Create data loaders
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank
+        )
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank
+        )
+        shuffle = False
+    else:
+        # Use weighted sampler for imbalanced data
+        train_sampler = train_dataset.get_sampler()
+        val_sampler = None
+        shuffle = (train_sampler is None)
+    
+    # Apply system recommendations for batch size and workers
+    batch_size = config.training.batch_size if hasattr(config.training, 'batch_size_override') else settings['batch_size']
+    num_workers = settings['num_workers']
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=settings['pin_memory'],
+        drop_last=True
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        sampler=val_sampler,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=settings['pin_memory']
+    )
+    
+    # Create model
+    model = create_model(
+        backbone_name=config.model.backbone,
+        num_classes=config.model.num_classes,
+        pretrained=config.model.pretrained
+    )
+    
+    # Enable model compilation if supported
+    if settings['compile_model'] and hasattr(torch, 'compile'):
+        model = torch.compile(model)
+        if is_main_process():
+            logger.info("Model compilation enabled")
+    
+    model = model.to(device)
+    
+    # Wrap model for distributed training
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=False
+        )
+    
+    # Create loss function
+    loss_fn = CombinedLoss(
+        ce_weight=config.loss.ce_weight,
+        dice_weight=config.loss.dice_weight,
+        focal_weight=config.loss.focal_weight,
+        class_weights=config.loss.class_weights
+    )
+    
+    # Wrap with hard negative mining if enabled
+    if config.loss.hard_negative_mining:
+        loss_fn = HardNegativeMiningLoss(
+            base_loss=loss_fn,
+            neg_pos_ratio=config.loss.neg_pos_ratio,
+            start_epoch=config.loss.hnm_start_epoch
+        )
+    
+    # Create optimizer and scheduler
+    optimizer = create_optimizer(model, config)
+    scheduler, warmup_scheduler = create_scheduler(optimizer, config, len(train_loader))
+    
+    # Create metrics
+    metrics = MetricCollection(
+        num_classes=config.model.num_classes,
+        ignore_index=config.loss.ignore_index
+    )
+    
+    # Create callbacks
+    callbacks = []
+    
+    if is_main_process():
+        # Early stopping
+        early_stopping = EarlyStopping(
+            patience=config.callbacks.early_stopping.patience,
+            min_delta=config.callbacks.early_stopping.min_delta,
+            monitor=config.callbacks.early_stopping.monitor,
+            mode=config.callbacks.early_stopping.mode
+        )
+        callbacks.append(early_stopping)
+        
+        # Model checkpoint
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=config.callbacks.checkpoint.dirpath,
+            filename=config.callbacks.checkpoint.filename,
+            monitor=config.callbacks.checkpoint.monitor,
+            save_top_k=config.callbacks.checkpoint.save_top_k,
+            mode=config.callbacks.checkpoint.mode
+        )
+        callbacks.append(checkpoint_callback)
+        
+        # Visualization
+        viz_callback = VisualizePredictions(
+            log_dir=config.callbacks.visualization.log_dir,
+            num_samples=config.callbacks.visualization.num_samples,
+            log_every_n_epochs=config.callbacks.visualization.log_every_n_epochs
+        )
+        callbacks.append(viz_callback)
+    
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        criterion=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        warmup_scheduler=warmup_scheduler,
+        device=device,
+        mixed_precision=config.training.mixed_precision,
+        accumulate_grad_batches=config.training.accumulate_grad_batches,
+        clip_grad_norm=config.training.clip_grad_norm,
+        callbacks=callbacks,
+        metrics=metrics
+    )
+    
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        start_epoch = trainer.load_checkpoint(args.resume)
+        if is_main_process():
+            logger.info(f"Resumed training from epoch {start_epoch}")
+    
+    # Start training
+    if is_main_process():
+        logger.info("Starting training...")
+    
+    try:
+        trainer.fit(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epochs=config.training.num_epochs,
+            start_epoch=start_epoch
+        )
+        
+        if is_main_process():
+            logger.info("Training completed successfully!")
+            
+    except KeyboardInterrupt:
+        if is_main_process():
+            logger.info("Training interrupted by user")
+    except Exception as e:
+        if is_main_process():
+            logger.error(f"Training failed: {str(e)}")
+        raise
+    finally:
+        if args.distributed:
+            cleanup_ddp()
+
+
+def main():
+    """Main function."""
+    parser = argparse.ArgumentParser(description='Train Swin-UNet for wafer defect segmentation')
+    parser.add_argument('--config', type=str, required=True, help='Path to config file')
+    parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')
+    parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
+    parser.add_argument('--world-size', type=int, default=-1, help='Number of processes for distributed training')
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = OmegaConf.load(args.config)
+    
+    # Print system info in single-GPU mode
+    if not args.distributed:
+        print_system_info()
+    
+    # Setup distributed training
+    if args.distributed:
+        # Get world size from environment or use auto-detection
+        if args.world_size == -1:
+            gpu_info = detect_gpu()
+            args.world_size = gpu_info['gpu_count'] if gpu_info['has_gpu'] else 1
+        
+        if args.world_size > 1:
+            mp.spawn(train_worker, args=(args.world_size, config, args), nprocs=args.world_size)
+        else:
+            print("Warning: Distributed training requested but only 1 GPU available")
+            train_worker(0, 1, config, args)
+    else:
+        train_worker(0, 1, config, args)
+
+
+if __name__ == '__main__':
+    main()
 
 import os
 import sys

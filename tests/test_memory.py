@@ -65,7 +65,7 @@ def test_tiling_memory_usage():
     """Test memory usage of tiling operations."""
     if not TORCH_AVAILABLE:
         print("Skipping tiling memory test - PyTorch not available")
-        return True
+        assert True  # Test passed
         
     print("Testing tiling memory usage...")
     
@@ -94,11 +94,14 @@ def test_tiling_memory_usage():
         if i % 5 == 0:
             gc.collect()
     
-    # Test stitching
+    # Test stitching with proper output dimensions
+    output_height = min(512, large_image.shape[0])
+    output_width = min(512, large_image.shape[1])
+    
     reconstructed = stitcher.stitch_tiles(
         sample_tiles, 
         tile_coords[:10], 
-        (512, 512)  # Smaller output for testing
+        (output_height, output_width)
     )
     
     memory_used = profiler.stop_tracking()
@@ -112,14 +115,14 @@ def test_tiling_memory_usage():
     assert memory_used < image_size_mb * 3, f"Memory usage too high: {memory_used:.1f} MB"
     
     print("✓ Tiling memory test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_model_memory_scaling():
     """Test memory scaling with batch size."""
     if not TORCH_AVAILABLE:
         print("Skipping model memory test - PyTorch not available")
-        return True
+        assert True  # Test passed
         
     print("Testing model memory scaling...")
     
@@ -170,14 +173,14 @@ def test_model_memory_scaling():
         assert ratio < expected_max_ratio, f"Memory scaling too high: {ratio:.2f}"
     
     print("✓ Model memory scaling test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_gradient_accumulation_memory():
     """Test memory usage with gradient accumulation."""
     if not TORCH_AVAILABLE:
         print("Skipping gradient accumulation test - PyTorch not available")
-        return True
+        assert True  # Test passed
         
     print("Testing gradient accumulation memory...")
     
@@ -243,14 +246,14 @@ def test_gradient_accumulation_memory():
             "Gradient accumulation should not increase memory significantly"
     
     print("✓ Gradient accumulation memory test passed!")
-    return True
+    assert True  # Test passed
 
 
 def test_memory_cleanup():
     """Test that memory is properly cleaned up."""
     if not TORCH_AVAILABLE:
         print("Skipping memory cleanup test - PyTorch not available")
-        return True
+        assert True  # Test passed
         
     print("Testing memory cleanup...")
     
@@ -294,7 +297,7 @@ def test_memory_cleanup():
     print(f"CPU memory used: {cpu_memory_used:.1f} MB")
     
     print("✓ Memory cleanup test passed!")
-    return True
+    assert True  # Test passed
 
 
 def run_all_tests():
@@ -303,7 +306,7 @@ def run_all_tests():
     
     if not TORCH_AVAILABLE:
         print("PyTorch not available - running limited tests")
-        return True
+        assert True  # Test passed
     
     tests = [
         test_tiling_memory_usage,
