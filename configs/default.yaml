@@ -1,0 +1,65 @@
+data:
+  root: ./data
+  tile_size: 512
+  stride: 256
+  oversample_ratio: 3
+  num_workers: 4
+  pin_memory: true
+  
+model:
+  backbone: swin_large_patch4_window12_384
+  decoder_channels: [1024, 512, 256, 128, 64]
+  dropout: 0.1
+  
+training:
+  batch_size: 8  # per GPU
+  accumulate_grad: 2
+  epochs: 120
+  val_every_n_epochs: 2
+  num_workers: 4
+  deterministic: true
+  seed: 42
+  
+optimizer:
+  lr: 1e-4
+  weight_decay: 0.01
+  
+scheduler:
+  T_max: 120  # Same as epochs
+  warmup_epochs: 5
+  
+loss:
+  ce_weight: 0.7
+  dice_weight: 0.3
+  label_smoothing: 0.1
+  
+callbacks:
+  early_stopping:
+    patience: 15
+    monitor: val_iou
+    mode: max
+  model_checkpoint:
+    monitor: val_iou
+    mode: max
+    save_top_k: 3
+    filename: "epoch-{epoch:02d}-val_iou-{val_iou:.4f}"
+  hard_negative_mining:
+    start_epoch: 30
+  visualization:
+    save_every_n_epochs: 10
+    
+logging:
+  use_wandb: false
+  use_tensorboard: true
+  project: wafer-segmentation
+  log_every_n_steps: 50
+  
+inference:
+  fp16: true
+  max_memory_gb: 10
+  min_area: 100
+  gaussian_sigma: 1.0
+  
+distributed:
+  backend: nccl
+  find_unused_parameters: false
