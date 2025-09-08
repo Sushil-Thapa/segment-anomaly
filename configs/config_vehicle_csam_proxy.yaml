@@ -1,0 +1,219 @@
+model:
+  architecture: swin_unet
+  encoder: swin_large
+  decoder: unet
+  in_channels: 1
+  num_classes: 2
+  img_size: 512
+  swin:
+    patch_size: 4
+    window_size: 8
+    depths:
+    - 2
+    - 2
+    - 18
+    - 2
+    embed_dim: 192
+    num_heads:
+    - 6
+    - 12
+    - 24
+    - 48
+    mlp_ratio: 4.0
+    drop_rate: 0.1
+    attn_drop_rate: 0.1
+    drop_path_rate: 0.3
+  unet:
+    features:
+    - 1536
+    - 768
+    - 384
+    - 192
+    - 96
+    use_attention: true
+    use_deep_supervision: true
+data:
+  dataset_name: vehicle_damage_grayscale_proxy
+  dataset_kagglehub: hendrichscullen/vehide-dataset-automatic-vehicle-damage-detection
+  data_dir: data/vehicle_damage_csam_proxy
+  train_split: train
+  val_split: val
+  test_split: test
+  tiling:
+    tile_size: 512
+    adaptive_overlap: true
+    overlap_range:
+    - 0.5
+    - 0.75
+    overlap_threshold: 0.1
+  dataset:
+    dataset_format: coco
+    type: SAMAcousticDataset
+    cache_enabled: true
+    cache_dir: data/cache
+    force_grayscale: true
+    grayscale_method: luminance
+    dynamic_oversampling:
+      enabled: true
+      max_ratio: 3.0
+      update_frequency: 100
+      min_samples_per_class: 10
+    hard_negative_mining:
+      enabled: true
+      ratio: 0.3
+      update_frequency: 50
+      loss_threshold: 0.7
+  normalization:
+    mean:
+    - 0.4656639442038564
+    - 0.4656639442038564
+    - 0.4656639442038564
+    std:
+    - 0.2577099514938046
+    - 0.2577099514938046
+    - 0.2577099514938046
+    computed_from_data: true
+transforms:
+  train_transform:
+    tile_size: 512
+    use_dataset_normalization: true
+    sam_mode: true
+    grayscale_mode: true
+    speckle_noise:
+      enabled: true
+      p: 0.4
+      intensity:
+      - 0.05
+      - 0.2
+    acoustic_noise:
+      enabled: true
+      p: 0.3
+      noise_types:
+      - gaussian
+      - multiplicative
+    tile_jitter:
+      enabled: true
+      max_shift: 32
+      p: 0.5
+    random_flip:
+      enabled: true
+      horizontal: 0.5
+      vertical: 0.5
+    random_rotation:
+      enabled: true
+      degrees:
+      - -45
+      - 45
+      p: 0.4
+    brightness_contrast:
+      enabled: true
+      brightness_limit: 0.3
+      contrast_limit: 0.3
+      p: 0.6
+    defect_copy_paste:
+      enabled: true
+      p: 0.2
+      max_objects: 2
+      min_defect_area: 50
+  val_transform:
+    tile_size: 512
+    use_dataset_normalization: true
+    sam_mode: true
+    grayscale_mode: true
+  test_transform:
+    tile_size: 512
+    use_dataset_normalization: true
+    sam_mode: true
+    grayscale_mode: true
+training:
+  optimizer: AdamW
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 5
+  max_epochs: 80
+  batch_size: 4  # Reduced for better progress visibility and MPS compatibility
+  num_workers: 2  # Reduced for Mac
+  val_every_n_epochs: 5  # Run validation every 5 epochs
+  loss:
+    type: combined
+    dice_weight: 0.5
+    ce_weight: 0.3
+    focal_weight: 0.2
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    class_weights:
+    - 1.0
+    - 2.5
+  validation:
+    frequency: 5
+    metrics:
+    - dice
+    - iou
+    - precision
+    - recall
+    - f1
+  checkpoints:
+    save_best: true
+    save_last: true
+    monitor: val_dice
+    mode: max
+evaluation:
+  metrics:
+  - dice
+  - iou
+  - precision
+  - recall
+  - f1
+  - accuracy
+  csam_simulation_metrics:
+    single_channel_performance: true
+    grayscale_conversion_quality: true
+    defect_preservation: true
+  inference:
+    use_tiling: true
+    tile_size: 512
+    overlap: 0.6
+    batch_size: 16
+logging:
+  log_dir: logs/vehicle_csam_proxy
+  experiment_name: vehicle_damage_csam_proxy
+  log_every_n_steps: 2  # Very frequent updates - every 2 batches
+  wandb:
+    enabled: false
+    project: csam-proxy-vehicle-damage
+  tensorboard:
+    enabled: true
+    log_images: true
+    log_frequency: 10
+callbacks:
+  early_stopping:
+    enabled: true
+    patience: 10
+    monitor: val_dice
+    mode: max
+    min_delta: 0.001
+hardware:
+  device: mps  # Use MPS for Mac M-series GPU
+  mixed_precision: false  # Disable for MPS compatibility
+  compile_model: false
+  memory:
+    pin_memory: false  # Disable for MPS
+    non_blocking: true
+    prefetch_factor: 2
+download:
+  enabled: true
+  auto_download: true
+  kagglehub:
+    dataset: hendrichscullen/vehide-dataset-automatic-vehicle-damage-detection
+    extract_path: data/vehicle_damage_csam_proxy
+  post_process:
+    create_splits: true
+    split_ratios:
+    - 0.7
+    - 0.15
+    - 0.15
+    random_seed: 42
+    force_grayscale: true
+    grayscale_method: luminance
+    preserve_originals: false

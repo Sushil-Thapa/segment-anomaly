@@ -1,0 +1,211 @@
+# Debug/Test Configuration - Quick pipeline testing with minimal data
+# Based on config_vehicle_csam_proxy.yaml but with debug sampling enabled
+
+model:
+  architecture: swin_unet
+  encoder: swin_large
+  decoder: unet
+  in_channels: 1
+  num_classes: 2
+  img_size: 512
+  swin:
+    patch_size: 4
+    window_size: 8
+    depths:
+    - 2
+    - 2
+    - 18
+    - 2
+    embed_dim: 192
+    num_heads:
+    - 6
+    - 12
+    - 24
+    - 48
+    mlp_ratio: 4.0
+    drop_rate: 0.1
+    attn_drop_rate: 0.1
+    drop_path_rate: 0.3
+  unet:
+    features:
+    - 1536
+    - 768
+    - 384
+    - 192
+    - 96
+    use_attention: true
+    use_deep_supervision: true
+
+data:
+  dataset_name: vehicle_damage_grayscale_proxy_debug
+  dataset_kagglehub: hendrichscullen/vehide-dataset-automatic-vehicle-damage-detection
+  data_dir: data/vehicle_damage_csam_proxy
+  train_split: train
+  val_split: val
+  test_split: test
+  tiling:
+    tile_size: 512
+    adaptive_overlap: true
+    overlap_range:
+    - 0.5
+    - 0.75
+    overlap_threshold: 0.1
+  dataset:
+    dataset_format: coco
+    type: SAMAcousticDataset
+    cache_enabled: false  # Disable cache for debug mode
+    cache_dir: data/cache
+    force_grayscale: true
+    grayscale_method: luminance
+    dynamic_oversampling:
+      enabled: true
+      max_ratio: 2.0  # Reduced for debug
+      update_frequency: 10  # More frequent for small dataset
+      min_samples_per_class: 2  # Lower threshold for debug
+    hard_negative_mining:
+      enabled: false  # Disabled for simplicity in debug mode
+      ratio: 0.3
+      update_frequency: 50
+      loss_threshold: 0.7
+  normalization:
+    mean:
+    - 0.4656639442038564
+    - 0.4656639442038564
+    - 0.4656639442038564
+    std:
+    - 0.2577099514938046
+    - 0.2577099514938046
+    - 0.2577099514938046
+    computed_from_data: true
+
+transforms:
+  train_transform:
+    tile_size: 512
+    use_dataset_normalization: true
+    sam_mode: true
+    grayscale_mode: true
+    # Simplified transforms for debug mode
+    random_flip:
+      enabled: true
+      horizontal: 0.5
+      vertical: 0.5
+    brightness_contrast:
+      enabled: true
+      brightness_limit: 0.2
+      contrast_limit: 0.2
+      p: 0.4
+  val_transform:
+    tile_size: 512
+    use_dataset_normalization: true
+    sam_mode: true
+    grayscale_mode: true
+  test_transform:
+    tile_size: 512
+    use_dataset_normalization: true
+    sam_mode: true
+    grayscale_mode: true
+
+training:
+  optimizer: AdamW
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 1  # Reduced for debug
+  max_epochs: 2  # Quick debug training
+  batch_size: 2  # Small for debug
+  num_workers: 2  # Reduced for Mac
+  val_every_n_epochs: 1  # Validate every epoch in debug mode
+  loss:
+    type: combined
+    dice_weight: 0.5
+    ce_weight: 0.3
+    focal_weight: 0.2
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    class_weights:
+    - 1.0
+    - 2.5
+  validation:
+    frequency: 1  # Validate every epoch in debug mode
+    metrics:
+    - dice
+    - iou
+    - precision
+    - recall
+    - f1
+  checkpoints:
+    save_best: true
+    save_last: true
+    monitor: val_dice
+    mode: max
+
+evaluation:
+  metrics:
+  - dice
+  - iou
+  - precision
+  - recall
+  - f1
+  - accuracy
+  csam_simulation_metrics:
+    single_channel_performance: true
+    grayscale_conversion_quality: true
+    defect_preservation: true
+  inference:
+    use_tiling: true
+    tile_size: 512
+    overlap: 0.6
+    batch_size: 4  # Small for debug
+
+logging:
+  log_dir: logs/debug_test
+  experiment_name: debug_vehicle_damage_test
+  log_every_n_steps: 1  # Log every batch in debug mode
+  wandb:
+    enabled: false
+    project: debug-test
+  tensorboard:
+    enabled: true
+    log_images: true
+    log_frequency: 5
+
+callbacks:
+  early_stopping:
+    enabled: false  # Disabled for short debug runs
+    patience: 5
+    monitor: val_dice
+    mode: max
+    min_delta: 0.001
+
+# DEBUG MODE CONFIGURATION - This is the key section!
+debug:
+  enabled: true  # Enable debug/test mode
+  sample_ratio: 0.001  # Use only 0.5% of data (very small for quick testing)
+  max_images: 5  # Alternatively, limit to max 50 images per split
+  description: "Debug mode for quick pipeline testing - samples minimal data"
+
+hardware:
+  device: mps  # Use MPS for Mac M-series GPU
+  mixed_precision: false  # Disable for MPS compatibility
+  compile_model: false
+  memory:
+    pin_memory: false  # Disable for MPS
+    non_blocking: true
+    prefetch_factor: 1  # Reduced for debug
+
+download:
+  enabled: true
+  auto_download: true
+  kagglehub:
+    dataset: hendrichscullen/vehide-dataset-automatic-vehicle-damage-detection
+    extract_path: data/vehicle_damage_csam_proxy
+  post_process:
+    create_splits: true
+    split_ratios:
+    - 0.7
+    - 0.15
+    - 0.15
+    random_seed: 42
+    force_grayscale: true
+    grayscale_method: luminance
+    preserve_originals: false
