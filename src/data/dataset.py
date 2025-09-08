@@ -1,5 +1,5 @@
 """
-Dataset implementation for wafer defect segmentation with tiling support.
+Dataset implementation for wafer defect and SAM acoustic microscopy segmentation with tiling support.
 """
 
 import os
@@ -12,325 +12,914 @@ from typing import List, Tuple, Dict, Optional, Callable, Union
 import glob
 from pathlib import Path
 import pickle
-from .tiling import TileGenerator
-from .transforms import get_train_transform, get_val_transform
+import math
+from .tiling import TileGenerator, ConfigurableTileGenerator, SAMAdaptiveTileGenerator
+from .transforms import (
+    get_train_transform,
+    get_val_transform,
+    get_sam_train_transform,
+    get_sam_val_transform,
+    WaferSpecificTransforms,
+    SAMSpecificTransforms,
+)
 
 
-class WaferTileDataset(Dataset):
+class DynamicOversamplingDataset(Dataset):
     """
-    Dataset for wafer defect segmentation with tile-based loading and caching.
+    Dataset with dynamic oversampling that adapts as model improves.
+
+    Key features:
+    - 5x initial oversampling decaying to 3x
+    - Dynamic adjustment based on model performance
+    - Configurable stride for different modes
+    - Dataset-specific normalization support
     """
-    
-    def __init__(self,
-                 data_root: str,
-                 split: str = 'train',
-                 tile_size: int = 512,
-                 stride: int = 256,
-                 transform: Optional[Callable] = None,
-                 oversample_ratio: float = 3.0,
-                 cache_tiles: bool = True,
-                 precompute_tiles: bool = True):
+
+    def __init__(
+        self,
+        data_root: str,
+        split: str = "train",
+        tile_size: int = 512,
+        train_stride: int = 384,
+        val_stride: int = 256,
+        transform: Optional[Callable] = None,
+        initial_oversample_ratio: float = 5.0,
+        target_oversample_ratio: float = 3.0,
+        oversample_decay_epochs: int = 50,
+        cache_tiles: bool = True,
+        precompute_tiles: bool = True,
+        enable_dynamic_sampling: bool = True,
+        dataset_format: str = "coco",
+        config: Optional[dict] = None,
+    ):
         """
-        Initialize dataset.
-        
+        Initialize dynamic oversampling dataset.
+
+        Args:
+            data_root: Root directory containing images and masks
+            split: Dataset split ('train', 'val', 'test')
+        """
+        # Store parameters
+        self.data_root = Path(data_root)
+        self.split = split
+        self.tile_size = tile_size
+        self.transform = transform
+        self.initial_oversample_ratio = initial_oversample_ratio
+        self.target_oversample_ratio = target_oversample_ratio
+        self.oversample_decay_epochs = oversample_decay_epochs
+        self.cache_tiles = cache_tiles
+        self.enable_dynamic_sampling = enable_dynamic_sampling
+        self.dataset_format = dataset_format.lower() if dataset_format else "coco"
+        self.config = config or {}
+
+        # Extract grayscale settings from config
+        dataset_config = self.config.get("data", {}).get("dataset", {})
+        self.force_grayscale = dataset_config.get("force_grayscale", False)
+        self.grayscale_method = dataset_config.get("grayscale_method", "luminance")
+
+        # Test/Debug mode settings
+        debug_config = self.config.get("debug", {})
+        self.debug_mode = debug_config.get("enabled", False)
+        self.debug_sample_ratio = debug_config.get(
+            "sample_ratio", 0.01
+        )  # 1% by default
+        self.debug_max_images = debug_config.get(
+            "max_images", None
+        )  # Optional absolute limit
+
+        # Current training state
+        self.current_epoch = 0
+        self.current_oversample_ratio = initial_oversample_ratio
+        self.model_performance_history = []
+
+        # Initialize configurable tiler
+        self.tiler = ConfigurableTileGenerator(
+            tile_size=tile_size,
+            train_stride=train_stride,
+            val_stride=val_stride,
+            inference_stride=train_stride,
+            use_gaussian_weights=True,
+        )
+
+        # Initialize data paths
+        self.image_paths = []
+        self.mask_paths = []
+        self.labels = []  # For detection/YOLO/VOC
+
+        # Load data based on format
+        if self.dataset_format == "coco":
+            self._load_coco()
+        elif self.dataset_format == "yolo":
+            self._load_yolo()
+        elif self.dataset_format == "voc":
+            self._load_voc()
+        else:
+            raise ValueError(f"Unsupported dataset format: {self.dataset_format}")
+
+        # Apply debug/test mode sampling if enabled
+        if self.debug_mode:
+            self._apply_debug_sampling()
+
+        # Precompute tile information
+        self.tile_info = []
+        self.positive_tiles = []
+        self.negative_tiles = []
+        self.tile_cache = {}
+        if precompute_tiles:
+            self._precompute_tiles()
+        self._update_sample_weights()
+
+    def _load_coco(self):
+        """Load images and masks from COCO format."""
+        coco_dir = self.data_root / "coco" / self.split
+        ann_path = coco_dir / "annotations.json"
+        with open(ann_path, "r") as f:
+            coco = json.load(f)
+        imgs = {img["id"]: img for img in coco["images"]}
+        anns = coco["annotations"]
+        img_to_anns = {}
+        for ann in anns:
+            img_to_anns.setdefault(ann["image_id"], []).append(ann)
+        self.coco_imgs = imgs
+        self.coco_img_to_anns = img_to_anns
+        self.coco_ids = list(imgs.keys())
+        self.image_paths = [
+            str(coco_dir / "images" / imgs[img_id]["file_name"])
+            for img_id in self.coco_ids
+        ]
+        self.mask_paths = [img_id for img_id in self.coco_ids]  # Use img_id as mask ref
+        self.coco_ann_path = ann_path
+        self.coco_dir = coco_dir
+
+    def _load_yolo(self):
+        """Load images and labels from YOLO format (segmentation or detection)."""
+        yolo_dir = self.data_root / "yolo" / self.split
+        images_dir = yolo_dir / "images"
+        labels_dir = yolo_dir / "labels"
+        image_extensions = ["*.jpg", "*.jpeg", "*.png"]
+        for ext in image_extensions:
+            self.image_paths.extend(sorted(glob.glob(str(images_dir / ext))))
+        for img_path in self.image_paths:
+            img_name = Path(img_path).stem
+            label_path = labels_dir / f"{img_name}.txt"
+            self.labels.append(str(label_path))
+
+    def _load_voc(self):
+        """Load images and masks from Pascal VOC format."""
+        voc_dir = self.data_root / "voc" / self.split
+        images_dir = voc_dir / "images"
+        masks_dir = voc_dir / "masks"
+        image_extensions = ["*.jpg", "*.jpeg", "*.png"]
+        for ext in image_extensions:
+            self.image_paths.extend(sorted(glob.glob(str(images_dir / ext))))
+        for img_path in self.image_paths:
+            img_name = Path(img_path).stem
+            mask_path = masks_dir / f"{img_name}.png"
+            self.mask_paths.append(str(mask_path))
+
+    def _load_file_paths(self):
+        """Load image and mask file paths."""
+        if self.split == "train":
+            images_dir = self.data_root / "train" / "images"
+            masks_dir = self.data_root / "train" / "masks"
+        elif self.split == "val":
+            images_dir = self.data_root / "val" / "images"
+            masks_dir = self.data_root / "val" / "masks"
+        else:
+            images_dir = self.data_root / "test" / "images"
+            masks_dir = self.data_root / "test" / "masks"
+
+        # Find all image files
+        image_extensions = ["*.jpg", "*.jpeg", "*.png", "*.tiff", "*.tif"]
+
+        for ext in image_extensions:
+            pattern = str(images_dir / ext)
+            self.image_paths.extend(glob.glob(pattern))
+
+        # Find corresponding masks
+        for image_path in self.image_paths:
+            image_name = Path(image_path).stem
+
+            # Try different mask extensions
+            mask_extensions = ["png", "jpg", "jpeg", "tiff", "tif"]
+            mask_path = None
+
+            for mask_ext in mask_extensions:
+                candidate = masks_dir / f"{image_name}.{mask_ext}"
+                if candidate.exists():
+                    mask_path = str(candidate)
+                    break
+
+            if mask_path is None:
+                print(f"Warning: No mask found for {image_path}")
+                continue
+
+            self.mask_paths.append(mask_path)
+
+        print(f"Loaded {len(self.image_paths)} image-mask pairs for {self.split} split")
+
+    def _apply_debug_sampling(self):
+        """Apply debug/test mode sampling to reduce dataset size for quick testing."""
+        import random
+
+        original_size = len(self.image_paths)
+
+        if original_size == 0:
+            print("⚠️  No images loaded, skipping debug sampling")
+            return
+
+        # Calculate sample size
+        if self.debug_max_images is not None:
+            sample_size = min(self.debug_max_images, original_size)
+        else:
+            sample_size = max(1, int(original_size * self.debug_sample_ratio))
+
+        if sample_size >= original_size:
+            print(
+                f"🐛 Debug mode: Using all {original_size} images (sample size >= dataset size)"
+            )
+            return
+
+        # Set seed for reproducible sampling
+        random.seed(42)
+
+        # Create indices and sample
+        indices = list(range(original_size))
+        sampled_indices = sorted(random.sample(indices, sample_size))
+
+        # Sample all lists consistently
+        self.image_paths = [self.image_paths[i] for i in sampled_indices]
+        self.mask_paths = [self.mask_paths[i] for i in sampled_indices]
+        if hasattr(self, "labels") and self.labels:
+            self.labels = [self.labels[i] for i in sampled_indices]
+
+        print(
+            f"🐛 DEBUG MODE: Sampled {sample_size} images ({sample_size/original_size*100:.1f}%) from {original_size} total"
+        )
+        print(
+            f"📊 Sample ratio: {self.debug_sample_ratio*100:.1f}% | Max images: {self.debug_max_images}"
+        )
+        print(
+            f"⚡ This will significantly speed up training for testing pipeline issues!"
+        )
+
+    def _precompute_tiles(self):
+        """Precompute all tiles with defect information."""
+        total_images = len(self.image_paths)
+        print(f"🔄 Precomputing tiles for {total_images} images...")
+        mode = "train" if self.split == "train" else "val"
+        for img_idx, image_path in enumerate(self.image_paths):
+            # Show progress every 100 images with progress bar
+            if (img_idx + 1) % 100 == 0 or img_idx == 0:
+                progress_pct = ((img_idx + 1) / total_images) * 100
+                bar_length = 30
+                filled_length = int(bar_length * (img_idx + 1) // total_images)
+                bar = "█" * filled_length + "-" * (bar_length - filled_length)
+                print(
+                    f"\r📊 Processing |{bar}| {progress_pct:5.1f}% [{img_idx + 1:4d}/{total_images:4d}]",
+                    end="",
+                    flush=True,
+                )
+                print(f"  Processed {img_idx + 1}/{len(self.image_paths)} images...")
+
+            if self.dataset_format == "coco":
+                img_id = self.coco_ids[img_idx]
+                img_info = self.coco_imgs[img_id]
+                height, width = img_info["height"], img_info["width"]
+                mask = np.zeros((height, width), dtype=np.uint8)
+                anns = self.coco_img_to_anns.get(img_id, [])
+                for ann in anns:
+                    for seg in ann["segmentation"]:
+                        pts = np.array(seg, dtype=np.float32).reshape(-1, 2)
+                        pts = np.round(pts).astype(np.int32)
+                        cv2.fillPoly(mask, [pts], color=ann["category_id"])
+            elif self.dataset_format == "yolo":
+                image = cv2.imread(image_path)
+                height, width = image.shape[:2]
+                mask = np.zeros((height, width), dtype=np.uint8)
+                label_path = self.labels[img_idx]
+                if os.path.exists(label_path):
+                    with open(label_path, "r") as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) < 5:
+                                continue
+                            cls = int(parts[0])
+                            if len(parts) > 5:
+                                pts = np.array(
+                                    [float(x) for x in parts[1:]], dtype=np.float32
+                                ).reshape(-1, 2)
+                                pts[:, 0] *= width
+                                pts[:, 1] *= height
+                                pts = np.round(pts).astype(np.int32)
+                                cv2.fillPoly(mask, [pts], color=cls)
+                            else:
+                                x_c, y_c, w, h = map(float, parts[1:5])
+                                x_c *= width
+                                y_c *= height
+                                w *= width
+                                h *= height
+                                x1 = int(x_c - w / 2)
+                                y1 = int(y_c - h / 2)
+                                x2 = int(x_c + w / 2)
+                                y2 = int(y_c + h / 2)
+                                cv2.rectangle(
+                                    mask, (x1, y1), (x2, y2), color=cls, thickness=-1
+                                )
+            elif self.dataset_format == "voc":
+                mask_path = self.mask_paths[img_idx]
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                height, width = mask.shape
+            else:
+                raise ValueError(f"Unsupported dataset format: {self.dataset_format}")
+
+            tile_coords = self.tiler.get_tile_indices(height, width, mode=mode)
+            for tile_coord in tile_coords:
+                start_y, end_y, start_x, end_x = tile_coord
+                mask_tile = mask[start_y:end_y, start_x:end_x]
+                if mask_tile.shape != (self.tile_size, self.tile_size):
+                    mask_tile = cv2.resize(
+                        mask_tile,
+                        (self.tile_size, self.tile_size),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                has_defect = bool(np.any(mask_tile > 0))  # Convert to Python bool
+                defect_density = np.sum(mask_tile > 0) / (
+                    self.tile_size * self.tile_size
+                )
+                tile_info = {
+                    "image_idx": img_idx,
+                    "coords": tile_coord,
+                    "has_defect": has_defect,
+                    "defect_density": defect_density,
+                }
+                tile_idx = len(self.tile_info)
+                self.tile_info.append(tile_info)
+                if has_defect:
+                    self.positive_tiles.append(tile_idx)
+                else:
+                    self.negative_tiles.append(tile_idx)
+        print(
+            f"\n✅ Precomputed {len(self.tile_info)} tiles: "
+            f"{len(self.positive_tiles)} positive, {len(self.negative_tiles)} negative"
+        )
+        if len(self.tile_info) > 0:
+            print(
+                f"📈 Positive ratio: {len(self.positive_tiles) / len(self.tile_info):.4f}"
+            )
+        else:
+            print("❌ No tiles found.")
+
+    def update_epoch(self, epoch: int, performance_metrics: Optional[Dict] = None):
+        """
+        Update current epoch and adapt sampling strategy.
+
+        Args:
+            epoch: Current training epoch
+            performance_metrics: Dict containing model performance metrics
+        """
+        self.current_epoch = epoch
+
+        # Store performance history for dynamic adaptation
+        if performance_metrics is not None:
+            self.model_performance_history.append(performance_metrics)
+
+        # Update oversample ratio with decay
+        if self.oversample_decay_epochs > 0:
+            decay_factor = min(1.0, epoch / self.oversample_decay_epochs)
+            self.current_oversample_ratio = (
+                self.initial_oversample_ratio
+                - decay_factor
+                * (self.initial_oversample_ratio - self.target_oversample_ratio)
+            )
+
+        # Dynamic adaptation based on recent performance
+        if self.enable_dynamic_sampling and len(self.model_performance_history) > 5:
+            self._adapt_sampling_strategy()
+
+        # Update sample weights
+        self._update_sample_weights()
+
+        print(
+            f"Epoch {epoch}: Updated oversample ratio to {self.current_oversample_ratio:.2f}"
+        )
+
+    def _adapt_sampling_strategy(self):
+        """Adapt sampling strategy based on model performance."""
+        if len(self.model_performance_history) < 5:
+            return
+
+        # Get recent performance metrics
+        recent_metrics = self.model_performance_history[-5:]
+
+        # Check if false positive rate is high (adjust as needed)
+        if "precision" in recent_metrics[-1]:
+            recent_precision = [m.get("precision", 0.5) for m in recent_metrics]
+            avg_precision = np.mean(recent_precision)
+
+            # If precision is low (high FP rate), increase negative sampling
+            if avg_precision < 0.7:
+                self.current_oversample_ratio = min(
+                    self.current_oversample_ratio * 1.1, 8.0
+                )
+                print(
+                    f"Low precision detected ({avg_precision:.3f}), increasing oversample ratio"
+                )
+            elif avg_precision > 0.9:
+                # High precision, can reduce oversampling
+                self.current_oversample_ratio = max(
+                    self.current_oversample_ratio * 0.95, self.target_oversample_ratio
+                )
+                print(
+                    f"High precision detected ({avg_precision:.3f}), reducing oversample ratio"
+                )
+
+    def _update_sample_weights(self):
+        """Update sample weights based on current oversampling strategy."""
+        if self.split != "train" or len(self.positive_tiles) == 0:
+            self.sample_weights = None
+            return
+
+        # Calculate weights for balanced sampling
+        num_positive = len(self.positive_tiles)
+        num_negative = len(self.negative_tiles)
+        total_samples = len(self.tile_info)
+
+        # Target samples per class based on oversampling ratio
+        target_positive_samples = int(
+            total_samples / (1 + self.current_oversample_ratio)
+        )
+        target_negative_samples = int(
+            target_positive_samples * self.current_oversample_ratio
+        )
+
+        # Calculate sample weights
+        weights = np.zeros(total_samples)
+
+        # Weight positive samples
+        pos_weight = target_positive_samples / num_positive if num_positive > 0 else 0
+        for idx in self.positive_tiles:
+            weights[idx] = pos_weight
+
+        # Weight negative samples
+        neg_weight = target_negative_samples / num_negative if num_negative > 0 else 0
+        for idx in self.negative_tiles:
+            weights[idx] = neg_weight
+
+        self.sample_weights = torch.from_numpy(weights).float()
+
+        print(
+            f"Updated sample weights: pos_weight={pos_weight:.4f}, neg_weight={neg_weight:.4f}"
+        )
+
+    def get_weighted_sampler(self) -> Optional[WeightedRandomSampler]:
+        """Get weighted random sampler for dynamic oversampling."""
+        if self.sample_weights is None:
+            return None
+
+        return WeightedRandomSampler(
+            weights=self.sample_weights,
+            num_samples=len(self.sample_weights),
+            replacement=True,
+        )
+
+    def __len__(self) -> int:
+        """Get dataset length."""
+        return len(self.tile_info)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a single tile sample, loading images/masks/labels according to dataset_format.
+        """
+        if self.cache_tiles and idx in self.tile_cache:
+            return self.tile_cache[idx]
+
+        tile_info = self.tile_info[idx]
+        image_idx = tile_info["image_idx"]
+        coords = tile_info["coords"]
+
+        if self.dataset_format == "coco":
+            # Load image
+            img_id = self.coco_ids[image_idx]
+            img_info = self.coco_imgs[img_id]
+            img_path = self.coco_dir / "images" / img_info["file_name"]
+            image = cv2.imread(str(img_path))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Convert to grayscale if required
+            if self.force_grayscale:
+                if self.grayscale_method == "luminance":
+                    image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                    # Keep as single channel since model expects 1 channel
+                elif self.grayscale_method == "average":
+                    image = np.mean(image, axis=2).astype(np.uint8)
+
+            height, width = img_info["height"], img_info["width"]
+            # Build mask from polygons
+            mask = np.zeros((height, width), dtype=np.uint8)
+            anns = self.coco_img_to_anns.get(img_id, [])
+            for ann in anns:
+                for seg in ann["segmentation"]:
+                    pts = np.array(seg, dtype=np.float32).reshape(-1, 2)
+                    pts = np.round(pts).astype(np.int32)
+                    cv2.fillPoly(mask, [pts], color=ann["category_id"])
+        elif self.dataset_format == "yolo":
+            image_path = self.image_paths[image_idx]
+            label_path = self.labels[image_idx]
+            image = cv2.imread(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Convert to grayscale if required
+            if self.force_grayscale:
+                if self.grayscale_method == "luminance":
+                    image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                    # Keep as single channel since model expects 1 channel
+                elif self.grayscale_method == "average":
+                    image = np.mean(image, axis=2).astype(np.uint8)
+
+            # Build mask from YOLO segmentation/detection txt
+            if len(image.shape) == 2:  # Grayscale
+                height, width = image.shape
+            else:  # RGB
+                height, width = image.shape[:2]
+            mask = np.zeros((height, width), dtype=np.uint8)
+            if os.path.exists(label_path):
+                with open(label_path, "r") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) < 5:
+                            continue  # Not enough info
+                        cls = int(parts[0])
+                        # If segmentation: x1 y1 x2 y2 ...
+                        if len(parts) > 5:
+                            pts = np.array(
+                                [float(x) for x in parts[1:]], dtype=np.float32
+                            ).reshape(-1, 2)
+                            pts[:, 0] *= width
+                            pts[:, 1] *= height
+                            pts = np.round(pts).astype(np.int32)
+                            cv2.fillPoly(mask, [pts], color=cls)
+                        else:
+                            # Detection: x_center y_center w h (normalized)
+                            x_c, y_c, w, h = map(float, parts[1:5])
+                            x_c *= width
+                            y_c *= height
+                            w *= width
+                            h *= height
+                            x1 = int(x_c - w / 2)
+                            y1 = int(y_c - h / 2)
+                            x2 = int(x_c + w / 2)
+                            y2 = int(y_c + h / 2)
+                            cv2.rectangle(
+                                mask, (x1, y1), (x2, y2), color=cls, thickness=-1
+                            )
+        elif self.dataset_format == "voc":
+            image_path = self.image_paths[image_idx]
+            mask_path = self.mask_paths[image_idx]
+            image = cv2.imread(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Convert to grayscale if required
+            if self.force_grayscale:
+                if self.grayscale_method == "luminance":
+                    image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                elif self.grayscale_method == "average":
+                    image = np.mean(image, axis=2).astype(np.uint8)
+
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        else:
+            raise ValueError(f"Unsupported dataset format: {self.dataset_format}")
+
+        # Extract tile
+        start_y, end_y, start_x, end_x = coords
+        image_tile = image[start_y:end_y, start_x:end_x]
+        mask_tile = mask[start_y:end_y, start_x:end_x]
+
+        # Resize if needed (for edge tiles)
+        if image_tile.shape[:2] != (self.tile_size, self.tile_size):
+            image_tile = cv2.resize(image_tile, (self.tile_size, self.tile_size))
+            mask_tile = cv2.resize(
+                mask_tile,
+                (self.tile_size, self.tile_size),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        # Apply transforms
+        if self.transform:
+            transformed = self.transform(image=image_tile, mask=mask_tile)
+            image_tile = transformed["image"]
+            mask_tile = transformed["mask"]
+        else:
+            # Handle single channel vs multi-channel images
+            if len(image_tile.shape) == 2:  # Grayscale
+                image_tile = (
+                    torch.from_numpy(image_tile).float().unsqueeze(0) / 255.0
+                )  # Add channel dimension
+            else:  # RGB
+                image_tile = (
+                    torch.from_numpy(image_tile.transpose(2, 0, 1)).float() / 255.0
+                )
+            mask_tile = torch.from_numpy(mask_tile).long()
+
+        sample = {
+            "image": image_tile,
+            "mask": mask_tile,
+            "has_defect": bool(
+                tile_info["has_defect"]
+            ),  # Convert numpy.bool_ to Python bool
+            "defect_density": tile_info["defect_density"],
+            "image_idx": image_idx,
+            "coords": coords,
+        }
+
+        if self.cache_tiles:
+            self.tile_cache[idx] = sample
+
+        return sample
+
+
+# Backward compatibility alias
+class WaferTileDataset(DynamicOversamplingDataset):
+    """Backward compatibility alias for DynamicOversamplingDataset."""
+
+    pass
+
+
+class SAMAcousticDataset(DynamicOversamplingDataset):
+    """
+    Dataset for SAM acoustic microscopy defect segmentation.
+
+    Specialized features:
+    - Adaptive tiling with 50-75% overlap
+    - Grayscale image support with RGB conversion
+    - Speckle and acoustic noise simulation
+    - Defect-aware tile positioning
+    - Copy-paste augmentation with acoustic defect synthesis
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        split: str = "train",
+        tile_size: int = 512,
+        overlap_range: Tuple[float, float] = (0.5, 0.75),
+        transform: Optional[Callable] = None,
+        precompute_tiles: bool = False,
+        cache_dir: Optional[str] = None,
+        initial_positive_ratio: float = 0.75,
+        final_positive_ratio: float = 0.5,
+        ratio_decay_epochs: int = 50,
+        hard_negative_mining: bool = True,
+        defect_synthesis: bool = True,
+        defect_image_dir: Optional[str] = None,
+    ):
+        """
+        Initialize SAM acoustic microscopy dataset.
+
         Args:
             data_root: Root directory containing images and masks
             split: Dataset split ('train', 'val', 'test')
             tile_size: Size of tiles to extract
-            stride: Stride for tile extraction
-            transform: Transform pipeline to apply
-            oversample_ratio: Ratio of positive to negative samples
-            cache_tiles: Whether to cache extracted tiles
-            precompute_tiles: Whether to precompute all tile indices
+            overlap_range: Range of overlap percentages for adaptive tiling
+            transform: Transform to apply to samples
+            precompute_tiles: Whether to precompute all tiles
+            cache_dir: Directory to cache computed tiles
+            initial_positive_ratio: Initial oversampling ratio for positive samples
+            final_positive_ratio: Final oversampling ratio for positive samples
+            ratio_decay_epochs: Number of epochs over which to decay ratio
+            hard_negative_mining: Whether to use hard negative mining
+            defect_synthesis: Whether to enable defect synthesis
+            defect_image_dir: Directory containing defect images for copy-paste
         """
-        self.data_root = Path(data_root)
-        self.split = split
-        self.tile_size = tile_size
-        self.stride = stride
-        self.transform = transform
-        self.oversample_ratio = oversample_ratio
-        self.cache_tiles = cache_tiles
-        
-        # Initialize tiler
-        self.tiler = TileGenerator(tile_size=tile_size, stride=stride)
-        
-        # Load file paths
-        self.image_paths = []
-        self.mask_paths = []
-        self._load_file_paths()
-        
-        # Precompute tile information
-        self.tile_info = []  # List of (image_idx, tile_coords, has_defect)
-        self.tile_cache = {}  # Cache for tiles
-        
-        if precompute_tiles:
-            self._precompute_tiles()
-        
-        # Setup weighted sampling for training
-        if split == 'train' and oversample_ratio > 1.0:
-            self.sample_weights = self._compute_sample_weights()
+        # Initialize base class with dynamic oversampling
+        super().__init__(
+            data_root=data_root,
+            split=split,
+            tile_size=tile_size,
+            stride=int(tile_size * (1 - max(overlap_range))),  # Conservative stride
+            transform=transform,
+            precompute_tiles=precompute_tiles,
+            cache_dir=cache_dir,
+            initial_positive_ratio=initial_positive_ratio,
+            final_positive_ratio=final_positive_ratio,
+            ratio_decay_epochs=ratio_decay_epochs,
+            hard_negative_mining=hard_negative_mining,
+        )
+
+        self.overlap_range = overlap_range
+        self.defect_synthesis = defect_synthesis
+        self.defect_image_dir = defect_image_dir
+
+        # Initialize SAM-specific components
+        self.sam_tiler = SAMAdaptiveTileGenerator(
+            tile_size=tile_size, overlap_range=overlap_range, defect_avoidance=True
+        )
+
+        # Load defect images for synthesis if available
+        self.defect_images = []
+        if defect_synthesis and defect_image_dir and os.path.exists(defect_image_dir):
+            self._load_defect_images()
+
+        # Initialize SAM-specific transforms if none provided
+        if transform is None:
+            self._setup_sam_transforms()
+
+    def _load_defect_images(self):
+        """Load defect images for copy-paste synthesis."""
+        defect_files = glob.glob(
+            os.path.join(self.defect_image_dir, "*.png")
+        ) + glob.glob(os.path.join(self.defect_image_dir, "*.jpg"))
+
+        for defect_file in defect_files[:50]:  # Limit to 50 defect images
+            try:
+                img = cv2.imread(defect_file)
+                if img is not None:
+                    # Convert to grayscale and then back to RGB for consistency
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    rgb_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+                    self.defect_images.append(rgb_img)
+            except Exception as e:
+                print(f"Warning: Could not load defect image {defect_file}: {e}")
+
+        print(f"Loaded {len(self.defect_images)} defect images for synthesis")
+
+    def _setup_sam_transforms(self):
+        """Setup SAM-specific transforms."""
+        sam_factory = SAMSpecificTransforms(
+            data_dir=self.data_root, defect_images=self.defect_images
+        )
+
+        if self.split == "train":
+            self.transform = sam_factory.get_train_transform(self.tile_size)
         else:
-            self.sample_weights = None
-    
-    def _load_file_paths(self):
-        """Load image and mask file paths."""
-        images_dir = self.data_root / 'images' / self.split
-        masks_dir = self.data_root / 'masks' / self.split
-        
-        # Find all image files
-        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.tiff', '*.tif']
-        for ext in image_extensions:
-            self.image_paths.extend(glob.glob(str(images_dir / ext)))
-        
-        self.image_paths.sort()
-        
-        # Find corresponding mask files
-        for img_path in self.image_paths:
-            img_name = Path(img_path).stem
-            mask_path = None
-            
-            # Try different mask extensions
-            for ext in ['png', 'jpg', 'jpeg', 'tiff', 'tif']:
-                potential_mask = masks_dir / f"{img_name}.{ext}"
-                if potential_mask.exists():
-                    mask_path = str(potential_mask)
-                    break
-            
-            if mask_path is None:
-                raise FileNotFoundError(f"No mask found for image {img_path}")
-            
-            self.mask_paths.append(mask_path)
-        
-        print(f"Loaded {len(self.image_paths)} images for {self.split} split")
-    
-    def _precompute_tiles(self):
-        """Precompute tile information for all images."""
-        cache_path = self.data_root / f"tile_cache_{self.split}_{self.tile_size}_{self.stride}.pkl"
-        
-        if cache_path.exists():
-            print(f"Loading precomputed tiles from {cache_path}")
-            with open(cache_path, 'rb') as f:
-                self.tile_info = pickle.load(f)
-            return
-        
-        print("Precomputing tile information...")
-        self.tile_info = []
-        
-        for img_idx, (img_path, mask_path) in enumerate(zip(self.image_paths, self.mask_paths)):
-            # Load image to get dimensions
-            image = cv2.imread(img_path)
-            if image is None:
-                raise ValueError(f"Could not load image: {img_path}")
-            
-            height, width = image.shape[:2]
-            
-            # Get tile coordinates
-            tile_coords = self.tiler.get_tile_indices(height, width)
-            
-            # Load mask to check for defects in each tile
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                raise ValueError(f"Could not load mask: {mask_path}")
-            
-            for coords in tile_coords:
-                start_y, end_y, start_x, end_x = coords
-                tile_mask = mask[start_y:end_y, start_x:end_x]
-                
-                # Check if tile contains defects
-                has_defect = np.any(tile_mask > 0)
-                
-                self.tile_info.append({
-                    'image_idx': img_idx,
-                    'coords': coords,
-                    'has_defect': has_defect
-                })
-        
-        # Save precomputed information
-        with open(cache_path, 'wb') as f:
-            pickle.dump(self.tile_info, f)
-        
-        print(f"Precomputed {len(self.tile_info)} tiles")
-    
-    def _compute_sample_weights(self) -> torch.Tensor:
-        """Compute sample weights for weighted random sampling."""
-        positive_count = sum(1 for tile in self.tile_info if tile['has_defect'])
-        negative_count = len(self.tile_info) - positive_count
-        
-        if positive_count == 0:
-            return torch.ones(len(self.tile_info))
-        
-        # Weight calculation: inversely proportional to class frequency
-        pos_weight = 1.0 / positive_count
-        neg_weight = 1.0 / negative_count
-        
-        # Apply oversampling ratio
-        pos_weight *= self.oversample_ratio
-        
-        weights = []
-        for tile in self.tile_info:
-            if tile['has_defect']:
-                weights.append(pos_weight)
-            else:
-                weights.append(neg_weight)
-        
-        return torch.tensor(weights, dtype=torch.float32)
-    
-    def _load_tile(self, image_idx: int, coords: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray]:
-        """Load a tile from an image and mask."""
-        cache_key = (image_idx, coords)
-        
-        if self.cache_tiles and cache_key in self.tile_cache:
-            return self.tile_cache[cache_key]
-        
-        # Load full image and mask
-        img_path = self.image_paths[image_idx]
-        mask_path = self.mask_paths[image_idx]
-        
-        image = cv2.imread(img_path)
+            self.transform = sam_factory.get_val_transform(self.tile_size)
+
+    def load_image_and_mask(
+        self, image_path: str, mask_path: str
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load image and mask with SAM-specific preprocessing.
+
+        Args:
+            image_path: Path to image file
+            mask_path: Path to mask file
+
+        Returns:
+            Tuple of (image, mask) arrays
+        """
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+
+        # Convert BGR to RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        
-        # Extract tile
-        image_tile = self.tiler.extract_tile(image, coords)
-        mask_tile = self.tiler.extract_tile(mask, coords)
-        
-        # Ensure mask is binary
-        mask_tile = (mask_tile > 0).astype(np.uint8)
-        
-        if self.cache_tiles:
-            self.tile_cache[cache_key] = (image_tile, mask_tile)
-        
-        return image_tile, mask_tile
-    
-    def __len__(self) -> int:
-        """Return dataset length."""
-        return len(self.tile_info)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single tile."""
-        tile_info = self.tile_info[idx]
-        image_idx = tile_info['image_idx']
-        coords = tile_info['coords']
-        
-        # Load tile
-        image_tile, mask_tile = self._load_tile(image_idx, coords)
-        
-        # Apply transforms
-        if self.transform:
-            transformed = self.transform(image=image_tile, mask=mask_tile)
-            image_tensor = transformed['image']
-            mask_tensor = transformed['mask']
+
+        # Convert to grayscale if it's not already (SAM typically uses grayscale)
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         else:
-            image_tensor = torch.from_numpy(image_tile.transpose(2, 0, 1)).float() / 255.0
-            mask_tensor = torch.from_numpy(mask_tile).long()
-        
-        return {
-            'image': image_tensor,
-            'mask': mask_tensor,
-            'image_idx': image_idx,
-            'coords': coords
-        }
-    
-    def get_sampler(self) -> Optional[WeightedRandomSampler]:
-        """Get weighted random sampler for training."""
-        if self.sample_weights is not None:
-            return WeightedRandomSampler(
-                weights=self.sample_weights,
-                num_samples=len(self.sample_weights),
-                replacement=True
-            )
-        return None
-    
+            gray = image
+
+        # For consistency with transform pipeline, we'll let GrayscaleToRGB handle conversion
+        image = gray
+
+        # Load mask
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            # Create empty mask if not found
+            mask = np.zeros(image.shape[:2], dtype=np.uint8)
+
+        # Ensure mask is binary
+        mask = (mask > 128).astype(np.uint8)
+
+        return image, mask
+
     def get_class_distribution(self) -> Dict[str, int]:
-        """Get class distribution statistics."""
-        positive_count = sum(1 for tile in self.tile_info if tile['has_defect'])
-        negative_count = len(self.tile_info) - positive_count
-        
-        return {
-            'positive': positive_count,
-            'negative': negative_count,
-            'total': len(self.tile_info),
-            'positive_ratio': positive_count / len(self.tile_info) if len(self.tile_info) > 0 else 0
-        }
+        """Get class distribution for SAM dataset."""
+        if hasattr(self, "tiles") and self.tiles:
+            defect_count = sum(
+                1 for tile in self.tiles if tile.get("has_defect", False)
+            )
+            background_count = len(self.tiles) - defect_count
+        else:
+            # Fallback to base class method
+            base_dist = super().get_class_distribution()
+            return {
+                "background": base_dist.get("negative", 0),
+                "acoustic_defect": base_dist.get("positive", 0),
+            }
+
+        return {"background": background_count, "acoustic_defect": defect_count}
+
+    def update_sampling_strategy(
+        self, epoch: int, performance_metrics: Optional[Dict] = None
+    ):
+        """
+        Update sampling strategy for SAM with acoustic-specific adaptations.
+
+        Args:
+            epoch: Current training epoch
+            performance_metrics: Optional performance metrics for adaptive adjustment
+        """
+        # Call parent method for base functionality
+        super().update_sampling_strategy(epoch, performance_metrics)
+
+        # SAM-specific adjustments based on acoustic defect detection performance
+        if performance_metrics and "precision" in performance_metrics:
+            precision = performance_metrics["precision"]
+
+            # If precision is low, increase positive sampling to find more defects
+            if precision < 0.7:
+                adjustment_factor = 1.2
+            # If precision is very high, we can be more selective
+            elif precision > 0.9:
+                adjustment_factor = 0.8
+            else:
+                adjustment_factor = 1.0
+
+            self.current_positive_ratio = min(
+                0.8, self.current_positive_ratio * adjustment_factor
+            )
 
 
-def create_dataloaders(config: dict, 
-                      num_workers: int = 4) -> Tuple[torch.utils.data.DataLoader, ...]:
+def create_dataloaders(
+    config: dict, num_workers: int = 4
+) -> Tuple[torch.utils.data.DataLoader, ...]:
     """
     Create train, validation, and test dataloaders.
-    
+
     Args:
         config: Configuration dictionary
         num_workers: Number of worker processes
-        
+
     Returns:
         Tuple of (train_loader, val_loader, test_loader)
     """
     # Create transforms
-    train_transform = get_train_transform(tile_size=config['data']['tile_size'])
-    val_transform = get_val_transform(tile_size=config['data']['tile_size'])
-    
+    train_transform = get_train_transform(tile_size=config["data"]["tile_size"])
+    val_transform = get_val_transform(tile_size=config["data"]["tile_size"])
+
     # Create datasets
     train_dataset = WaferTileDataset(
-        data_root=config['data']['root'],
-        split='train',
-        tile_size=config['data']['tile_size'],
-        stride=config['data']['stride'],
+        data_root=config["data"]["root"],
+        split="train",
+        tile_size=config["data"]["tile_size"],
+        stride=config["data"]["stride"],
         transform=train_transform,
-        oversample_ratio=config['data']['oversample_ratio']
+        oversample_ratio=config["data"]["oversample_ratio"],
     )
-    
+
     val_dataset = WaferTileDataset(
-        data_root=config['data']['root'],
-        split='val',
-        tile_size=config['data']['tile_size'],
-        stride=config['data']['stride'],
+        data_root=config["data"]["root"],
+        split="val",
+        tile_size=config["data"]["tile_size"],
+        stride=config["data"]["stride"],
         transform=val_transform,
-        oversample_ratio=1.0  # No oversampling for validation
+        oversample_ratio=1.0,  # No oversampling for validation
     )
-    
+
     test_dataset = WaferTileDataset(
-        data_root=config['data']['root'],
-        split='test',
-        tile_size=config['data']['tile_size'],
-        stride=config['data']['stride'],
+        data_root=config["data"]["root"],
+        split="test",
+        tile_size=config["data"]["tile_size"],
+        stride=config["data"]["stride"],
         transform=val_transform,
-        oversample_ratio=1.0  # No oversampling for test
+        oversample_ratio=1.0,  # No oversampling for test
     )
-    
+
     # Create samplers
     train_sampler = train_dataset.get_sampler()
-    
+
     # Create dataloaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=config["training"]["batch_size"],
         sampler=train_sampler,
         shuffle=(train_sampler is None),
         num_workers=num_workers,
-        pin_memory=config['data']['pin_memory'],
-        drop_last=True
+        pin_memory=config["data"]["pin_memory"],
+        drop_last=True,
     )
-    
+
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=config["training"]["batch_size"],
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=config['data']['pin_memory'],
-        drop_last=False
+        pin_memory=config["data"]["pin_memory"],
+        drop_last=False,
     )
-    
+
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=config["training"]["batch_size"],
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=config['data']['pin_memory'],
-        drop_last=False
+        pin_memory=config["data"]["pin_memory"],
+        drop_last=False,
     )
-    
+
     return train_loader, val_loader, test_loader
 
 
@@ -339,43 +928,43 @@ def test_dataset():
     # Create dummy data structure
     import tempfile
     import shutil
-    
+
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
-        
+
         # Create directory structure
-        for split in ['train', 'val', 'test']:
-            (temp_path / 'images' / split).mkdir(parents=True)
-            (temp_path / 'masks' / split).mkdir(parents=True)
-            
+        for split in ["train", "val", "test"]:
+            (temp_path / "images" / split).mkdir(parents=True)
+            (temp_path / "masks" / split).mkdir(parents=True)
+
             # Create dummy images and masks
             for i in range(3):
                 # Create dummy image
                 image = np.random.randint(0, 255, (1000, 1000, 3), dtype=np.uint8)
-                cv2.imwrite(str(temp_path / 'images' / split / f'image_{i}.png'), image)
-                
+                cv2.imwrite(str(temp_path / "images" / split / f"image_{i}.png"), image)
+
                 # Create dummy mask
                 mask = np.random.randint(0, 2, (1000, 1000), dtype=np.uint8) * 255
-                cv2.imwrite(str(temp_path / 'masks' / split / f'image_{i}.png'), mask)
-        
+                cv2.imwrite(str(temp_path / "masks" / split / f"image_{i}.png"), mask)
+
         # Test dataset
         dataset = WaferTileDataset(
             data_root=str(temp_path),
-            split='train',
+            split="train",
             tile_size=512,
             stride=256,
-            precompute_tiles=True
+            precompute_tiles=True,
         )
-        
+
         print(f"Dataset length: {len(dataset)}")
         print(f"Class distribution: {dataset.get_class_distribution()}")
-        
+
         # Test sample loading
         sample = dataset[0]
         print(f"Sample keys: {sample.keys()}")
         print(f"Image shape: {sample['image'].shape}")
         print(f"Mask shape: {sample['mask'].shape}")
-        
+
         return True
 
 
