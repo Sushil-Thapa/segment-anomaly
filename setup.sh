@@ -1,98 +1,61 @@
 #!/bin/bash
-# Cross-platform setup script for segment-anomaly
-
 set -e
 
-echo "🚀 Setting up segment-anomaly project..."
+echo "🚀 Setting up Swin-UNet Segmentation Framework..."
+echo
 
-# Detect platform
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    PLATFORM="macOS"
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    PLATFORM="Linux"
-elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
-    PLATFORM="Windows"
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Check if UV is installed
+if ! command -v uv &> /dev/null; then
+    echo -e "${YELLOW}UV not found. Installing UV...${NC}"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    source ~/.bashrc || source ~/.zshrc || true
+    echo -e "${GREEN}✅ UV installed successfully${NC}"
 else
-    PLATFORM="Unknown"
+    echo -e "${GREEN}✅ UV found${NC}"
 fi
 
-echo "🖥️  Detected platform: $PLATFORM"
-
-# Check for GPU support
-GPU_SUPPORT=""
-if command -v nvidia-smi &> /dev/null; then
-    GPU_INFO=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits 2>/dev/null || echo "")
-    if [[ -n "$GPU_INFO" ]]; then
-        echo "🎮 NVIDIA GPU detected: $GPU_INFO"
-        GPU_SUPPORT="cuda"
-    fi
-elif [[ "$PLATFORM" == "macOS" ]]; then
-    # Check for Apple Silicon
-    if [[ $(uname -m) == "arm64" ]]; then
-        echo "🍎 Apple Silicon detected - MPS support available"
-        GPU_SUPPORT="mps"
-    fi
-fi
-
-# Install dependencies with uv
-echo "📦 Installing dependencies with uv..."
-
-# Base installation
+# Install dependencies
+echo -e "${BLUE}📦 Installing dependencies...${NC}"
 uv sync
 
-# Platform-specific optimizations
-if [[ "$GPU_SUPPORT" == "cuda" ]]; then
-    echo "🔥 Installing CUDA-optimized PyTorch..."
-    uv add --index https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
-    
-    # Install apex for mixed precision on Linux/CUDA
-    if [[ "$PLATFORM" == "Linux" ]]; then
-        echo "⚡ Installing NVIDIA Apex for mixed precision..."
-        uv add --optional gpu apex || echo "⚠️  Could not install apex - mixed precision will use native PyTorch AMP"
-    fi
-    
-elif [[ "$GPU_SUPPORT" == "mps" ]]; then
-    echo "🍎 Installing MPS-optimized PyTorch for Apple Silicon..."
-    # macOS with Apple Silicon - use default PyTorch with MPS support
-    uv sync
-    
+# Create necessary directories
+echo -e "${BLUE}� Creating directories...${NC}"
+mkdir -p data/cache
+mkdir -p logs/sam
+mkdir -p logs/public
+mkdir -p checkpoints
+mkdir -p predictions
+
+echo -e "${GREEN}✅ Directories created${NC}"
+
+# Run tests to verify installation
+echo -e "${BLUE}🧪 Running tests to verify installation...${NC}"
+if uv run python -m pytest tests/ -v --tb=short; then
+    echo -e "${GREEN}✅ All tests passed!${NC}"
 else
-    echo "💻 Installing CPU-only PyTorch..."
-    uv add torch torchvision torchaudio --index https://download.pytorch.org/whl/cpu
+    echo -e "${RED}❌ Some tests failed. Please check the installation.${NC}"
+    exit 1
 fi
 
-# Install development dependencies
-echo "🛠️  Installing development dependencies..."
-uv sync --group dev
-
-echo "✅ Setup complete!"
-echo ""
-echo "🎯 Next steps:"
-echo "1. Prepare your data in the following structure:"
-echo "   data/"
-echo "   ├── train/"
-echo "   │   ├── images/"
-echo "   │   └── masks/"
-echo "   ├── val/"
-echo "   │   ├── images/" 
-echo "   │   └── masks/"
-echo "   └── test/"
-echo "       ├── images/"
-echo "       └── masks/"
-echo ""
-echo "2. Run training:"
-if [[ "$GPU_SUPPORT" == "cuda" ]]; then
-    echo "   # Single GPU"
-    echo "   uv run python train.py --config configs/default.yaml"
-    echo ""
-    echo "   # Multi-GPU (4 GPUs)"
-    echo "   uv run torchrun --nproc_per_node=4 train.py --config configs/default.yaml --distributed"
-else
-    echo "   uv run python train.py --config configs/default.yaml"
-fi
-echo ""
-echo "3. Run tests:"
-echo "   uv run python tests/run_tests.py"
-echo ""
-echo "4. Test multi-class support:"
-echo "   uv run python test_multiclass.py"
+echo
+echo -e "${GREEN}🎉 Setup completed successfully!${NC}"
+echo
+echo -e "${YELLOW}Next steps:${NC}"
+echo "  ${BLUE}For SAM Acoustic Microscopy:${NC}"
+echo "    1. Place your data in data/sam_acoustic/"
+echo "    2. Run: uv run python src/data/prepare.py data/sam_acoustic configs/config_sam.yaml"
+echo "    3. Train: uv run python src/train.py --config configs/config_sam.yaml"
+echo
+echo "  ${BLUE}For Public Dataset Demo:${NC}"
+echo "    1. Run: uv run python src/data/download.py configs/config_public.yaml"
+echo "    2. Prepare: uv run python src/data/prepare.py data/road_cracks configs/config_public.yaml"
+echo "    3. Train: uv run python src/train.py --config configs/config_public.yaml"
+echo
+echo -e "${GREEN}Happy segmenting! 🔬✨${NC}"

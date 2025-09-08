@@ -21,7 +21,7 @@ nvidia-smi >nul 2>&1
 if %errorlevel% equ 0 (
     echo 🎮 NVIDIA GPU detected
     echo 🔥 Installing CUDA-optimized PyTorch...
-    
+
     REM Install CUDA version of PyTorch
     uv sync
     uv add torch torchvision torchaudio --index https://download.pytorch.org/whl/cu121

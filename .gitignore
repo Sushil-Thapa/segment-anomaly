@@ -319,6 +319,9 @@ uv.lock
 # Ruff
 .ruff_cache/
 
+# Pre-commit
+.pre-commit-cache/
+
 # Project specific
 # Uncomment these if you have specific directories to ignore
 # inference_results/
