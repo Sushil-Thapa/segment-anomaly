@@ -221,7 +221,6 @@ $RECYCLE.BIN/
 .nfs*
 
 # Machine Learning / AI specific
-# Datasets (usually too large for git)
 data/
 datasets/
 raw_data/
