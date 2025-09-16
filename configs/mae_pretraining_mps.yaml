@@ -1,0 +1,163 @@
+# MAE Pretraining Configuration - MPS Optimized
+# Self-supervised pretraining using Masked Autoencoder optimized for Apple Silicon MPS
+
+# Experiment Info
+experiment_name: "mae_pretraining_swin_base_mps"
+description: "MPS-optimized MAE pretraining using Swin-Base for Apple Silicon compatibility"
+version: "1.0.0"
+
+# Data Configuration
+data:
+  root: "/tmp/mae_test_data"
+  tile_size: 224  # Match Swin-Tiny input size
+  in_channels: 3
+  pin_memory: false  # Disable for MPS compatibility
+
+  dataset:
+    force_grayscale: false
+    grayscale_method: "luminance"
+
+# MAE Pretraining Configuration
+mae:
+  # Data paths for unlabeled images
+  image_dirs:
+    - "sam_images"
+    - "unlabeled"
+    - "train/images"
+
+  # Model architecture - optimized for MPS memory constraints
+  backbone: "swin_tiny_patch4_window7_224"
+  decoder_dim: 128      # Smaller for memory efficiency
+  decoder_depth: 2      # Reduced for memory efficiency
+  decoder_heads: 4      # Reduced for memory efficiency
+
+  # Training parameters
+  mask_ratio: 0.75
+  batch_size: 1         # Small batch for MPS
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+
+  # Training schedule
+  epochs: 100
+  warmup_epochs: 10
+  min_lr: 1.0e-6
+
+  # Scheduler
+  use_scheduler: true
+  scheduler_type: "cosine"
+
+  # Data loading
+  max_images: null
+
+  # Visualization and monitoring
+  visualization_freq: 500
+  save_reconstructions: false  # Disable to save memory
+
+  # For debugging/testing
+  debug_mode: false
+  debug_sample_ratio: 0.001
+
+# Model Configuration
+model:
+  backbone: "swin_tiny_patch4_window7_224"
+  encoder: "swin_tiny"
+  pretrained: false  # Disable to reduce memory
+  in_channels: 3
+  dropout: 0.1
+
+  num_classes: 2
+  decoder_channels: [256, 128, 64, 32, 16]  # Much smaller for memory
+  use_attention: true
+  use_deep_supervision: false
+
+# Training Configuration
+training:
+  use_amp: false        # Disable AMP for MPS compatibility
+  grad_clip_norm: 1.0
+  accumulate_grad_batches: 1
+
+  log_interval: 10
+  save_interval: 5
+  eval_interval: 10
+
+  early_stopping:
+    enabled: false
+    patience: 20
+    min_delta: 1e-4
+
+  ddp: false
+
+# Callbacks configuration
+callbacks:
+  early_stopping:
+    monitor: "train_loss"
+    patience: 20
+    mode: "min"
+  model_checkpoint:
+    filename: "mae_mps_epoch_{epoch:03d}"
+    monitor: "train_loss"
+    mode: "min"
+    save_top_k: 3
+  lr_monitor:
+    logging_interval: "step"
+
+# System Configuration
+system:
+  device: "mps"
+  num_workers: 0        # Disable multiprocessing for MPS compatibility
+  seed: 42
+
+# Output Configuration
+output_dir: "./outputs/mae_pretraining_mps"
+checkpoint_dir: "./outputs/mae_pretraining_mps/checkpoints"
+log_dir: "./outputs/mae_pretraining_mps/logs"
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+  tensorboard:
+    enabled: false  # Disable for simplicity
+
+  wandb:
+    enabled: false
+
+# Debugging Configuration
+debug:
+  enabled: false
+  sample_ratio: 0.01
+  max_images: 100
+  fast_dev_run: false
+
+# Hardware Optimization for MPS
+optimization:
+  max_split_size_mb: 64    # Smaller for MPS
+  empty_cache_interval: 50  # More frequent cache clearing
+  benchmark: false         # Disable for MPS
+  deterministic: false
+
+# Resume Configuration
+resume:
+  checkpoint_path: null
+  load_optimizer: true
+  load_scheduler: true
+
+# Validation Configuration
+validation:
+  enabled: false
+  split_ratio: 0.1
+  data_root: null
+
+# Production Configuration
+production:
+  save_encoder_only: true
+  export_onnx: false
+  export_torchscript: false
+
+# Next Stage Configuration
+next_stage:
+  segmentation_config: "./configs/config_vehicle_csam_proxy.yaml"
+  load_mae_encoder: true
+  freeze_encoder_epochs: 5

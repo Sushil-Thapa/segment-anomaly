@@ -239,7 +239,6 @@ processed_data/
 
 # Model checkpoints and weights
 checkpoints/
-models/
 weights/
 *.pth
 *.pt
@@ -327,3 +326,5 @@ uv.lock
 # inference_results/
 # submission/
 # notebook_outputs/
+
+outputs/

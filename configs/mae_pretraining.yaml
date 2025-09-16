@@ -1,0 +1,178 @@
+# MAE Pretraining Configuration
+# Self-supervised pretraining using Masked Autoencoder on unlabeled SAM images
+
+# Experiment Info
+experiment_name: "mae_pretraining_swin_large"
+description: "Self-supervised pretraining using Masked Autoencoder on SAM acoustic microscopy images"
+version: "1.0.0"
+
+# Data Configuration
+data:
+  root: "/tmp/mae_test_data"  # Test data location
+  tile_size: 384  # Match Swin-Large input size
+  in_channels: 3  # 3 for RGB, 1 for grayscale
+  pin_memory: true
+
+  # Dataset-specific settings
+  dataset:
+    force_grayscale: false  # Set to true if your SAM images are grayscale
+    grayscale_method: "luminance"  # "luminance" or "average"
+
+# MAE Pretraining Configuration
+mae:
+  # Data paths for unlabeled images
+  image_dirs:
+    - "sam_images"           # Main SAM image directory
+    - "unlabeled"           # Additional unlabeled images
+    - "train/images"        # Can also use training images without masks
+    # Add more directories as needed
+
+  # Model architecture
+  backbone: "swin_large_patch4_window12_384"
+  decoder_dim: 512
+  decoder_depth: 8
+  decoder_heads: 16
+
+  # Training parameters
+  mask_ratio: 0.75              # 75% masking ratio
+  batch_size: 1                # Start with single batch for MPS testing with Swin-Large
+  learning_rate: 1.0e-4        # AdamW learning rate
+  weight_decay: 0.05           # Weight decay for regularization
+  betas: [0.9, 0.95]          # AdamW beta parameters
+
+  # Training schedule
+  epochs: 100                  # Number of pretraining epochs
+  warmup_epochs: 10           # Warmup epochs
+  min_lr: 1.0e-6              # Minimum learning rate
+
+  # Scheduler
+  use_scheduler: true
+  scheduler_type: "cosine"     # "cosine", "linear", or "reduce_on_plateau"
+
+  # Data loading
+  max_images: null            # null for all images, number to limit dataset size
+
+  # Visualization and monitoring
+  visualization_freq: 500     # Visualize reconstructions every N batches
+  save_reconstructions: true  # Save reconstruction visualizations
+
+  # For debugging/testing
+  debug_mode: false           # Enable for quick testing
+  debug_sample_ratio: 0.001   # Use 0.1% of data in debug mode
+
+# Model Configuration
+model:
+  backbone: "swin_large_patch4_window12_384"
+  encoder: "swin_large"
+  pretrained: true            # Use ImageNet pretrained weights as starting point
+  in_channels: 3              # Should match data.in_channels
+  dropout: 0.1
+
+  # These are for segmentation fine-tuning later
+  num_classes: 2
+  decoder_channels: [1024, 512, 256, 128, 64]
+  use_attention: true
+  use_deep_supervision: false
+
+# Training Configuration
+training:
+  use_amp: false              # Disable AMP for MPS compatibility
+  grad_clip_norm: 1.0         # Gradient clipping
+  accumulate_grad_batches: 1  # Gradient accumulation steps
+
+  # Logging and checkpointing
+  log_interval: 50            # Log every N batches
+  save_interval: 5            # Save checkpoint every N epochs
+  eval_interval: 10           # Evaluate every N epochs (if val data available)
+
+  # Early stopping (optional for pretraining)
+  early_stopping:
+    enabled: false            # Usually disabled for pretraining
+    patience: 20
+    min_delta: 1e-4
+
+  # Distributed training
+  ddp: false                  # Enable for multi-GPU training
+
+# Callbacks configuration (required by base trainer)
+callbacks:
+  early_stopping:
+    monitor: "train_loss"
+    patience: 20
+    mode: "min"
+  model_checkpoint:
+    filename: "mae_epoch_{epoch:03d}"
+    monitor: "train_loss"
+    mode: "min"
+    save_top_k: 3
+  lr_monitor:
+    logging_interval: "step"
+
+# System Configuration
+system:
+  device: "mps"               # Use "mps" for Apple Silicon, "cuda" for NVIDIA, "auto" for automatic
+  num_workers: 4              # Number of data loading workers
+  seed: 42                    # Random seed for reproducibility
+
+# Output Configuration
+output_dir: "./outputs/mae_pretraining"
+checkpoint_dir: "./outputs/mae_pretraining/checkpoints"
+log_dir: "./outputs/mae_pretraining/logs"
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+  # Tensorboard logging
+  tensorboard:
+    enabled: true
+    log_dir: "./outputs/mae_pretraining/tensorboard"
+
+  # Weights & Biases logging (optional)
+  wandb:
+    enabled: false            # Set to true if using W&B
+    project: "segment-anomaly-mae"
+    entity: null              # Your W&B entity name
+    tags: ["mae", "pretraining", "swin", "sam"]
+
+# Debugging Configuration
+debug:
+  enabled: false              # Enable debug mode for quick testing
+  sample_ratio: 0.01          # Use 1% of data in debug mode
+  max_images: 100             # Maximum images to use in debug mode
+  fast_dev_run: false         # Run single batch for testing
+
+# Hardware Optimization
+optimization:
+  # Memory management
+  max_split_size_mb: 128      # For CUDA memory management
+  empty_cache_interval: 100   # Empty CUDA cache every N batches
+
+  # Performance
+  benchmark: true             # Enable cudnn benchmark
+  deterministic: false        # Set to true for reproducible results (slower)
+
+# Resume Configuration
+resume:
+  checkpoint_path: null       # Path to checkpoint to resume from
+  load_optimizer: true        # Load optimizer state when resuming
+  load_scheduler: true        # Load scheduler state when resuming
+
+# Validation Configuration (optional for MAE pretraining)
+validation:
+  enabled: false              # Enable validation during pretraining
+  split_ratio: 0.1           # Fraction of data to use for validation
+  data_root: null            # Separate validation data root (if different)
+
+# Production/Deployment Configuration
+production:
+  save_encoder_only: true     # Save only encoder weights for downstream tasks
+  export_onnx: false         # Export to ONNX format
+  export_torchscript: false  # Export to TorchScript format
+
+# Next Stage Configuration (for pipeline transition)
+next_stage:
+  segmentation_config: "./configs/config_vehicle_csam_proxy.yaml"
+  load_mae_encoder: true     # Load MAE encoder for segmentation fine-tuning
+  freeze_encoder_epochs: 5   # Freeze encoder for N epochs during fine-tuning

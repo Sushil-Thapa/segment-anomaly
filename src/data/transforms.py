@@ -994,6 +994,7 @@ __all__ = [
     "get_val_transforms",  # Alias for backward compatibility
     "get_inference_transform",
     "get_tta_transforms",
+    "get_mae_transform",  # Added MAE transform
     "compute_dataset_statistics",
     "WaferSpecificTransforms",
     "SAMSpecificTransforms",
@@ -1059,6 +1060,60 @@ def test_transforms():
 
     print("All transform tests passed!")
     return True
+
+
+def get_mae_transform(tile_size: int = 384, in_channels: int = 3) -> Callable:
+    """
+    Get transform for MAE pretraining.
+
+    Args:
+        tile_size: Target image size
+        in_channels: Number of input channels
+
+    Returns:
+        Transform function
+    """
+    # Minimal augmentation for MAE - just normalization and light intensity jitter
+    if in_channels == 1:
+        # Grayscale transforms
+        transforms = [
+            A.Resize(tile_size, tile_size, interpolation=cv2.INTER_LINEAR),
+            A.OneOf(
+                [
+                    A.ColorJitter(brightness=0.1, contrast=0.1, p=0.5),
+                    A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+                ],
+                p=0.3,
+            ),
+            A.Normalize(
+                mean=[0.485],  # Grayscale mean
+                std=[0.229],  # Grayscale std
+                max_pixel_value=255.0,
+            ),
+            ToTensorV2(),
+        ]
+    else:
+        # RGB transforms
+        transforms = [
+            A.Resize(tile_size, tile_size, interpolation=cv2.INTER_LINEAR),
+            A.OneOf(
+                [
+                    A.ColorJitter(
+                        brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.5
+                    ),
+                    A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+                ],
+                p=0.3,
+            ),
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],  # ImageNet means
+                std=[0.229, 0.224, 0.225],  # ImageNet stds
+                max_pixel_value=255.0,
+            ),
+            ToTensorV2(),
+        ]
+
+    return A.Compose(transforms)
 
 
 if __name__ == "__main__":

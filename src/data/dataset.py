@@ -1,5 +1,6 @@
 """
 Dataset implementation for wafer defect and SAM acoustic microscopy segmentation with tiling support.
+Includes MAE dataset for self-supervised pretraining.
 """
 
 import os
@@ -13,6 +14,7 @@ import glob
 from pathlib import Path
 import pickle
 import math
+import random
 from .tiling import TileGenerator, ConfigurableTileGenerator, SAMAdaptiveTileGenerator
 from .transforms import (
     get_train_transform,
@@ -968,6 +970,345 @@ def test_dataset():
         return True
 
 
+class MAEPretrainingDataset(Dataset):
+    """
+    Dataset for MAE self-supervised pretraining on unlabeled images.
+
+    Key features:
+    - Loads unlabeled images without masks
+    - Supports millions of images for SSL pretraining
+    - Minimal augmentation (just normalization + light intensity jitter)
+    - Efficient loading with caching support
+    - Compatible with existing dataset structure
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        image_dirs: List[str] = None,
+        tile_size: int = 384,  # Match Swin input size
+        transform: Optional[Callable] = None,
+        cache_tiles: bool = False,  # Usually too many for caching
+        max_images: Optional[int] = None,
+        extensions: List[str] = [".jpg", ".jpeg", ".png", ".tiff", ".tif"],
+        in_channels: int = 3,
+        debug_mode: bool = False,
+        debug_sample_ratio: float = 0.001,  # 0.1% for debug
+        **kwargs,
+    ):
+        """
+        Initialize MAE pretraining dataset.
+
+        Args:
+            data_root: Root directory containing unlabeled images
+            image_dirs: List of subdirectories to search
+            tile_size: Size of image tiles for training
+            transform: Image transformations to apply
+            cache_tiles: Whether to cache processed tiles
+            max_images: Maximum number of images to use
+            extensions: Valid image file extensions
+            in_channels: Number of input channels (1 for grayscale, 3 for RGB)
+            debug_mode: Enable debug mode with small sample
+            debug_sample_ratio: Ratio of full dataset to use in debug mode
+        """
+        super().__init__()
+
+        self.data_root = Path(data_root)
+        self.tile_size = tile_size
+        self.in_channels = in_channels
+        self.debug_mode = debug_mode
+        self.cache_tiles = cache_tiles
+
+        # Discover all images
+        self.image_paths = self._discover_images(image_dirs, extensions, max_images)
+
+        # Apply debug sampling if needed
+        if debug_mode:
+            original_count = len(self.image_paths)
+            sample_count = max(1, int(original_count * debug_sample_ratio))
+            self.image_paths = random.sample(self.image_paths, sample_count)
+            print(f"Debug mode: Using {len(self.image_paths)}/{original_count} images")
+
+        # Set up transforms
+        if transform is None:
+            from .transforms import get_mae_transform
+
+            self.transform = get_mae_transform(tile_size, in_channels)
+        else:
+            self.transform = transform
+
+        # Optional tile cache
+        self.tile_cache = {} if cache_tiles else None
+
+        print(f"MAE dataset initialized with {len(self.image_paths)} images")
+        print(f"Sample image paths: {self.image_paths[:3]}")
+
+    def _discover_images(
+        self,
+        image_dirs: Optional[List[str]],
+        extensions: List[str],
+        max_images: Optional[int],
+    ) -> List[Path]:
+        """Discover all image files in the data directories."""
+        image_paths = []
+
+        # Determine search directories
+        if image_dirs is None:
+            # Search common directory patterns
+            search_dirs = ["images", "image", "data", "train", "val", "unlabeled"]
+            search_dirs = [d for d in search_dirs if (self.data_root / d).exists()]
+            if not search_dirs:
+                search_dirs = ["."]  # Search root directory
+        else:
+            search_dirs = image_dirs
+
+        # Search for images
+        for dir_name in search_dirs:
+            dir_path = self.data_root / dir_name
+
+            if not dir_path.exists():
+                print(f"Warning: Directory {dir_path} does not exist")
+                continue
+
+            # Search for images with all extensions
+            for ext in extensions:
+                patterns = [
+                    f"**/*{ext}",
+                    f"**/*{ext.upper()}",
+                ]
+
+                for pattern in patterns:
+                    found_paths = list(dir_path.glob(pattern))
+                    image_paths.extend(found_paths)
+
+        # Remove duplicates and sort
+        image_paths = sorted(list(set(image_paths)))
+
+        # Apply max_images limit
+        if max_images is not None and len(image_paths) > max_images:
+            image_paths = image_paths[:max_images]
+
+        if not image_paths:
+            raise ValueError(
+                f"No images found in {self.data_root} with directories {search_dirs}"
+            )
+
+        return image_paths
+
+    def __len__(self) -> int:
+        """Return dataset size."""
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a sample for MAE pretraining.
+
+        Args:
+            idx: Sample index
+
+        Returns:
+            Dictionary with 'image' tensor
+        """
+        # Check cache first
+        if self.tile_cache is not None and idx in self.tile_cache:
+            return self.tile_cache[idx]
+
+        # Load image
+        image_path = self.image_paths[idx]
+
+        try:
+            # Load image
+            image = cv2.imread(str(image_path))
+            if image is None:
+                raise ValueError(f"Could not load image: {image_path}")
+
+            # Convert to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Handle grayscale conversion if needed
+            if self.in_channels == 1:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                image = np.expand_dims(image, axis=-1)
+
+            # Resize to target size
+            if image.shape[:2] != (self.tile_size, self.tile_size):
+                image = cv2.resize(
+                    image,
+                    (self.tile_size, self.tile_size),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+            # Apply transforms
+            if self.transform:
+                # Ensure image is uint8
+                if image.dtype != np.uint8:
+                    image = (image * 255).astype(np.uint8)
+
+                # Apply albumentations transform
+                transformed = self.transform(image=image)
+                image = transformed["image"]
+            else:
+                # Default normalization
+                image = image.astype(np.float32) / 255.0
+
+                # Convert to torch tensor [C, H, W]
+                if len(image.shape) == 3:
+                    image = torch.from_numpy(image).permute(2, 0, 1)
+                else:
+                    image = torch.from_numpy(image).unsqueeze(0)
+
+            sample = {"image": image}
+
+            # Cache if enabled
+            if self.tile_cache is not None:
+                self.tile_cache[idx] = sample
+
+            return sample
+
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            # Return a dummy sample
+            dummy_image = torch.zeros(self.in_channels, self.tile_size, self.tile_size)
+            return {"image": dummy_image}
+
+    def get_sample_info(self, idx: int) -> Dict:
+        """Get information about a specific sample."""
+        image_path = self.image_paths[idx]
+
+        # Try to load image to get dimensions
+        try:
+            image = cv2.imread(str(image_path))
+            if image is not None:
+                h, w = image.shape[:2]
+            else:
+                h, w = 0, 0
+        except Exception:
+            h, w = 0, 0
+
+        return {
+            "index": idx,
+            "image_path": str(image_path),
+            "original_size": (h, w),
+            "tile_size": (self.tile_size, self.tile_size),
+        }
+
+    def clear_cache(self):
+        """Clear the tile cache to free memory."""
+        if self.tile_cache is not None:
+            self.tile_cache.clear()
+            print("Tile cache cleared")
+
+    def get_memory_usage(self) -> Dict[str, float]:
+        """Get memory usage statistics."""
+        cache_size = 0
+        if self.tile_cache is not None:
+            cache_size = len(self.tile_cache)
+
+        return {
+            "dataset_size": len(self.image_paths),
+            "cached_samples": cache_size,
+            "cache_ratio": (
+                cache_size / len(self.image_paths) if len(self.image_paths) > 0 else 0.0
+            ),
+        }
+
+
+def create_mae_dataset(config: dict, debug_mode: bool = False) -> MAEPretrainingDataset:
+    """
+    Create MAE dataset from configuration.
+
+    Args:
+        config: Configuration dictionary
+        debug_mode: Enable debug mode for testing
+
+    Returns:
+        MAEPretrainingDataset instance
+    """
+    data_config = config.get("data", {})
+    mae_config = data_config.get("mae", {})
+
+    # Get data root
+    data_root = mae_config.get("data_root", "data/mae_pretraining")
+    if not os.path.exists(data_root):
+        # Try alternative locations
+        alternative_roots = [
+            "data/unlabeled",
+            "data/train",
+            "data",
+            os.path.join(data_config.get("data_root", "data"), "images"),
+        ]
+
+        for alt_root in alternative_roots:
+            if os.path.exists(alt_root):
+                data_root = alt_root
+                break
+        else:
+            raise ValueError(
+                f"MAE data root not found. Tried: {[data_root] + alternative_roots}"
+            )
+
+    # Create dataset
+    dataset = MAEPretrainingDataset(
+        data_root=data_root,
+        image_dirs=mae_config.get("image_dirs", None),
+        tile_size=mae_config.get("tile_size", 384),
+        max_images=mae_config.get("max_images", None),
+        in_channels=config.get("model", {}).get("in_channels", 3),
+        debug_mode=debug_mode,
+        debug_sample_ratio=mae_config.get("debug_sample_ratio", 0.001),
+        cache_tiles=mae_config.get("cache_tiles", False),
+    )
+
+    return dataset
+
+
+def test_mae_dataset():
+    """Test MAE dataset functionality."""
+    # Create a dummy data directory structure for testing
+    import tempfile
+    import shutil
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create dummy images
+        images_dir = os.path.join(temp_dir, "images")
+        os.makedirs(images_dir)
+
+        # Create some dummy images
+        for i in range(5):
+            dummy_image = np.random.randint(0, 255, (384, 384, 3), dtype=np.uint8)
+            cv2.imwrite(os.path.join(images_dir, f"image_{i:03d}.jpg"), dummy_image)
+
+        # Test dataset creation
+        dataset = MAEPretrainingDataset(
+            data_root=temp_dir,
+            tile_size=384,
+            debug_mode=True,
+            debug_sample_ratio=1.0,  # Use all samples in test
+        )
+
+        print(f"MAE dataset size: {len(dataset)}")
+
+        # Test sample loading
+        sample = dataset[0]
+        print(f"Sample keys: {sample.keys()}")
+        print(f"Image shape: {sample['image'].shape}")
+        print(f"Image dtype: {sample['image'].dtype}")
+        print(
+            f"Image range: [{sample['image'].min():.3f}, {sample['image'].max():.3f}]"
+        )
+
+        # Test memory usage
+        memory_usage = dataset.get_memory_usage()
+        print(f"Memory usage: {memory_usage}")
+
+        # Test sample info
+        info = dataset.get_sample_info(0)
+        print(f"Sample info: {info}")
+
+        return True
+
+
 if __name__ == "__main__":
     test_dataset()
+    test_mae_dataset()
     print("Dataset tests passed!")
