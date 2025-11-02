@@ -1,91 +1,161 @@
-Style:
-While running the scripts, please make sure to ### MLflow tracking**: Integrated experiment tracking for all SSL phases
-  - Epoch-level metrics only: final_loss, total_epochs per phase (efficient, <0.1% overhead)
-  - Logs all hyperparameters: lr, batch_size, mask_ratio, teacher_temp, momentum, etc.
-  - Pipeline params: device, configs, resume/continue modes
-  - Nested runs: separate MAE and DINOv3 phases
-  - Artifacts: sequential_ssl_results.yaml
-  - View with: mlflow ui --backend-store-uri logs/mlruns
-  - No per-batch logging to avoid slowdown on large datasets (25,566 images) run python (recommended).
+## Project Style Guidelines
 
-While making a new feature or implementing something, please refrain from creating a new file each time if you dont think it is very ovious or critical. if additional classes in the same file makes more sense please do that instead. you could make new file for testing purposes if it is easier for you but once the feature is stable, please merge it with the existing files or remove the one time testing files. If I were you I'd just implement all core or script that will stay within the project files and styles and keeping the testing files separate so it is easier to remove them later and transitioning is not as difficult once you have tested it.
+### Code Organization
+- Integrate new features into existing files rather than creating separate modules
+- Testing files separate from production code for easy cleanup
+- No emojis in code/docs, keep tone professional and concise
+- Write as if the user wrote it themselves, not "because you asked"
 
-Please do not include emojis in the code comments or documentations. Please do not make it seem like it is overly verbose or written just for the sake of writing it. Dont make it too casual and mention you are doing something because i asked it. Make it seem like this is what I'd write if I were to write it myself.
+### Development Workflow
+- Use `uv run python` for all script execution
+- Git: Add files specifically, never `git add .` or `git add -A`
+- Avoid adding .md documentation files to git
 
-Remember:
-I do not want to add files with git add . or git add -A. I want to add them specifically. So please do not suggest commands that add everything. I for eg. do not want to add .md files that I keep creating to document things.
+### File Consolidation Pattern
+When implementing features:
+1. Add to existing appropriate file (e.g., trainer.py, swin_unet.py)
+2. Create temporary test file if needed
+3. Once stable, merge into existing files and remove test file
+4. Training scripts (train_*.py) serve as entry points only
 
-Update the sections below with the findings so that it might be useful for you n the future.
-# Learnings and documentations  (To be filled by Github Copilot below)
+## Self-Supervised Learning Pipeline
 
-## Self-Supervised Learning (SSL) Pipeline
+### Architecture Overview
+**Sequential Pipeline**: MAE → DINOv3 → Segmentation Fine-tuning
+- MAE: Learns pixel-level features via masked reconstruction (75% mask ratio)
+- DINOv3: Learns semantic features via self-distillation (initialized from MAE)
+- Both phases consolidated into existing files per project style
 
-### MAE (Masked Autoencoder) Pretraining
-- MAE pipeline fully implemented and consolidated into existing architecture files following project style guidelines
-- MAE components integrated into: decoder.py (MAEDecoder), swin_unet.py (MAESwinUNet), dataset.py (MAEPretrainingDataset), trainer.py (MAETrainer)
-- Separate MAE files (mae_decoder.py, mae_swin_unet.py, mae_dataset.py, mae_trainer.py) removed after consolidation to maintain clean codebase
-- Apple Silicon MPS acceleration validated and optimized for MAE training with memory management and error handling
-- MAE system supports 75% masking ratio, pixel reconstruction loss, seamless transition between pretraining and segmentation modes
-- Core training script src/train_mae.py for standalone MAE pretraining
-- Configuration files (mae_pretraining.yaml, mae_pretraining_mps.yaml) for production and MPS-optimized training
-- All MAE functionality consolidated per user style guidelines preferring feature integration over separate file creation
+### File Structure
+```
+src/
+├── models/swin_unet.py         # MAESwinUNet, DINOv3SwinUNet, DINOHead
+├── models/decoder.py           # MAEDecoder
+├── training/trainer.py         # MAETrainer, DINOv3Trainer (with MLflow support)
+├── data/dataset.py             # MAEPretrainingDataset, DINOv3PretrainingDataset
+├── data/transforms.py          # get_dino_multicrop_transform
+├── train_mae.py                # Standalone MAE entry point
+├── train_dinov3.py             # Standalone DINOv3 entry point
+└── train_sequential_ssl.py     # Sequential MAE→DINOv3 pipeline
 
-### DINOv3 Self-Distillation Pretraining
-- DINOv3 pipeline implemented following same consolidation pattern as MAE
-- DINOv3 components integrated into: swin_unet.py (DINOv3SwinUNet, DINOHead), trainer.py (DINOv3Trainer), dataset.py (DINOv3PretrainingDataset), transforms.py (get_dino_multicrop_transform)
-- Student-teacher framework with EMA momentum updates (momentum=0.996) for stable self-distillation
-- Multi-crop augmentation strategy: 2 global crops (384x384, scale 0.4-1.0) + 4-6 local crops (192x192, scale 0.05-0.4)
-- DINOHead projection: 3-layer MLP with bottleneck (encoder_dim → 2048 → 256 → output_dim)
-- Teacher temperature scheduling: linear warmup from 0.04 to 0.07 over 30 epochs for output sharpening
-- Center momentum (0.9) prevents mode collapse by maintaining running center of teacher outputs
-- Cross-entropy loss between student predictions and sharpened teacher outputs
-- Core training script src/train_dinov3.py for standalone DINOv3 pretraining
-- Configuration files (dinov3_pretraining.yaml, dinov3_pretraining_mps.yaml) for production and Apple Silicon
-- Can initialize from MAE checkpoint via load_mae_pretrained_encoder() method for sequential SSL
+configs/
+├── mae_pretraining.yaml        # Production MAE config
+├── mae_pretraining_mps.yaml    # Apple Silicon MAE
+├── dinov3_pretraining.yaml     # Production DINOv3 config
+└── dinov3_pretraining_mps.yaml # Apple Silicon DINOv3
+```
 
-### Sequential SSL Pipeline (MAE → DINOv3)
-- Full sequential pretraining pipeline implemented in src/train_sequential_ssl.py
-- Phase 1: MAE learns low-level visual features through masked reconstruction
-- Phase 2: DINOv3 refines semantic understanding through self-distillation, initialized from MAE weights
-- Sequential approach combines complementary strengths: MAE for pixel-level features, DINOv3 for semantic relationships
-- Pipeline orchestrates both phases automatically, handles checkpoint passing between stages
-- Supports skipping MAE phase if checkpoint already exists (--skip_mae flag)
-- **Resume capability**: Use --resume flag to continue interrupted training from existing checkpoint directory
-  - Automatically detects completed phases (MAE/DINOv3) and skips them
-  - Resumes incomplete phases from latest checkpoint with full state restoration (model, optimizer, scheduler)
-  - Supports changing dataset mid-training for additional pretraining
-  - Documentation in docs/RESUME_TRAINING.md
-- **Continue training**: Use --continue-training flag to train on new dataset with learned weights
-  - Loads final encoder weights from completed checkpoint
-  - Creates new checkpoint directory (preserves old checkpoints)
-  - Starts from epoch 0 with fresh optimizer/scheduler
-  - Perfect for multi-dataset pretraining workflows
-- **MLflow tracking**: Integrated experiment tracking for all SSL phases
-  - Tracks key metrics: loss, learning rate, epoch time
-  - Logs hyperparameters and model architecture
-  - Stores reconstruction samples (MAE) and training curves
-  - View with: mlflow ui --backend-store-uri logs/mlruns
-  - Efficient logging: only essential metrics to avoid slowdown
-- Outputs organized in timestamped directories: checkpoints/sequential_ssl_<timestamp>/mae/ and /dinov3/
-- Final encoder weights from DINOv3 phase used for downstream segmentation fine-tuning
-- Comprehensive documentation in docs/SEQUENTIAL_SSL.md covering architecture, usage, troubleshooting
+### MAE Pretraining Details
+- Mask ratio: 75%
+- Loss: Pixel reconstruction (MSE)
+- Decoder: Lightweight with encoder feature dims [96, 192, 384, 768]
+- Seamless mode switching: set_training_mode("mae")
+
+### DINOv3 Pretraining Details
+- Student-teacher EMA: momentum=0.996
+- Multi-crop strategy:
+  - Global: 2 crops @ 384x384 (scale 0.4-1.0)
+  - Local: 4-6 crops @ 192x192 (scale 0.05-0.4)
+- DINOHead: encoder_dim → 2048 → 256 → output_dim
+- Teacher temp: warmup 0.04→0.07 over 30 epochs
+- Center momentum: 0.9 (prevents mode collapse)
+- Loss: Cross-entropy(student, sharpened_teacher)
+- Initialization: load_mae_pretrained_encoder() for sequential SSL
 
 ### Apple Silicon (MPS) Optimizations
-- MPS-specific configs reduce batch sizes, model dimensions, and crop counts for memory constraints
-- Automatic cache management before tensor allocation
-- Gradient accumulation compensates for smaller batch sizes (e.g., batch_size=8, gradient_accumulation=4)
-- FP32 precision used (MPS doesn't support mixed precision)
-- Reduced DINOv3 output dimensions: 8192 (MPS) vs 65536 (CUDA) to fit memory
+- Reduced batch sizes and model dimensions
+- Automatic cache management: torch.mps.empty_cache()
+- Gradient accumulation: batch_size=8, accumulation=4
+- FP32 only (no mixed precision on MPS)
+- DINOv3 output_dim: 8192 (MPS) vs 65536 (CUDA)
 
-### Training Workflow
-- Standalone MAE: uv run python src/train_mae.py --config configs/mae_pretraining.yaml
-- Standalone DINOv3: uv run python src/train_dinov3.py --config configs/dinov3_pretraining.yaml [--mae_checkpoint PATH]
-- Sequential SSL: uv run python src/train_sequential_ssl.py --mae_config configs/mae_pretraining.yaml --dino_config configs/dinov3_pretraining.yaml
-- Segmentation fine-tuning: uv run python train.py --config configs/config_vehicle_csam_proxy.yaml --pretrained_encoder checkpoints/dinov3/dino_encoder_weights.pth
+### Training Commands
+```bash
+# Standalone MAE
+uv run python src/train_mae.py --config configs/mae_pretraining_mps.yaml
 
-### Code Organization Principles
-- All SSL functionality consolidated into existing files (swin_unet.py, trainer.py, dataset.py, transforms.py)
-- No separate module files (e.g., no mae.py or dino.py modules)
-- Training scripts (train_mae.py, train_dinov3.py, train_sequential_ssl.py) serve as entry points
-- Configuration files define pretraining parameters
-- Follow existing codebase style: integrate features within appropriate existing files rather than creating new modules
+# Standalone DINOv3 (optionally from MAE checkpoint)
+uv run python src/train_dinov3.py --config configs/dinov3_pretraining_mps.yaml [--mae_checkpoint PATH]
+
+# Sequential SSL (recommended)
+uv run python src/train_sequential_ssl.py \
+  --mae_config configs/mae_pretraining_mps.yaml \
+  --dino_config configs/dinov3_pretraining_mps.yaml
+
+# Resume interrupted training
+uv run python src/train_sequential_ssl.py ... --resume checkpoints/sequential_ssl_TIMESTAMP
+
+# Continue with new dataset (keeps weights, resets optimizer)
+uv run python src/train_sequential_ssl.py ... --continue-training checkpoints/sequential_ssl_TIMESTAMP
+
+# Segmentation fine-tuning
+uv run python src/train.py \
+  --config configs/config_vehicle_csam_proxy.yaml \
+  --pretrained_encoder checkpoints/sequential_ssl_TIMESTAMP/dinov3/dino_encoder_weights.pth
+```
+
+### Resume vs Continue-Training
+| Flag | Purpose | Checkpoint Dir | Optimizer | Epoch | Use Case |
+|------|---------|----------------|-----------|-------|----------|
+| --resume | Continue interrupted training | Same | Loaded | Resume from N | Power outage, crash |
+| --continue-training | Train on new data | New (timestamped) | Fresh | Start from 0 | Multi-dataset pretraining |
+| --skip_mae | Use existing MAE | Same/new | N/A | N/A | Already have MAE weights |
+
+### MLflow Experiment Tracking
+**Setup**: Automatic in train_sequential_ssl.py
+- Tracking URI: `logs/mlruns`
+- Experiment: `sequential_ssl`
+- View: `mlflow ui --backend-store-uri logs/mlruns`
+
+**Logged Parameters** (once per run):
+- Pipeline: mae/dino config paths, device, debug mode
+- MAE: epochs, batch_size, lr, weight_decay, mask_ratio, warmup_epochs, dataset_size
+- DINOv3: epochs, batch_size, lr, teacher_temp, student_temp, momentum, n_crops, dataset_size
+
+**Logged Metrics** (per epoch):
+- MAE: mae_epoch_loss, mae_learning_rate
+- DINOv3: dino_epoch_loss, dino_learning_rate, dino_teacher_temp
+
+**Logged Artifacts**:
+- sequential_ssl_results.yaml (final checkpoint paths and losses)
+
+**Design**: Epoch-level only (<0.1% overhead), no per-batch logging to avoid slowdown on 25,566 image dataset
+
+### Checkpoint Structure
+```
+checkpoints/sequential_ssl_20251101_194949/
+├── sequential_ssl_results.yaml
+├── train_sequential_ssl.log
+├── mae/
+│   ├── mae_encoder_weights.pth          # Final encoder (for DINOv3 init)
+│   ├── mae_best_checkpoint.pth          # Best model
+│   └── mae_checkpoint_epoch_*.pth       # Per-epoch checkpoints
+└── dinov3/
+    ├── dino_encoder_weights.pth         # Final encoder (for fine-tuning)
+    ├── dino_best_checkpoint.pth
+    └── dino_checkpoint_epoch_*.pth
+```
+
+### Known Issues & Solutions
+**DINOv3 Learning Rate = 0 at start**: Expected during warmup
+- With warmup_epochs=1 and 1452 batches/epoch, LR increases over 1452 steps
+- At batch 30, only 2% through warmup → LR ≈ 0
+- Solution: Increase total epochs to 5+ or disable warmup (warmup_epochs=0)
+
+**Trainer log_interval mismatch**: 
+- Trainer reads from `config.training.log_interval` (default 10)
+- If in `config.logging.log_interval`, trainer won't find it
+- Solution: Place log_interval in training section of YAML
+
+**MAE→DINOv3 key mismatch warning**: Non-critical
+- Naming difference: `layers_0` vs `layers.0`
+- Weights load correctly despite warning
+- Happens during strict=False loading
+
+**Reconstruction visualization errors**: Non-critical
+- Minor bug in visualization code
+- Does not affect training
+
+### Documentation
+- Sequential SSL details: docs/SEQUENTIAL_SSL.md
+- Resume/continue guide: docs/RESUME_TRAINING.md

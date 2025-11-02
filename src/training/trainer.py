@@ -773,6 +773,7 @@ class MAETrainer(Trainer):
         config: Dict[str, Any],
         device: torch.device,
         logger_obj: Optional[Any] = None,
+        mlflow_run: Optional[Any] = None,
         **kwargs,
     ):
         """
@@ -787,6 +788,7 @@ class MAETrainer(Trainer):
             config: Configuration dictionary
             device: Training device
             logger_obj: Logger instance
+            mlflow_run: MLflow run object for logging metrics
         """
         # Initialize base trainer
         super().__init__(
@@ -813,6 +815,7 @@ class MAETrainer(Trainer):
         )
         self.reconstruction_save_dir.mkdir(parents=True, exist_ok=True)
         self.log_interval = config.get("training", {}).get("log_interval", 10)
+        self.mlflow_run = mlflow_run
 
         # Setup checkpoint directory
         self.checkpoint_dir = Path(
@@ -853,6 +856,22 @@ class MAETrainer(Trainer):
                     history[key].extend(value)
                 else:
                     history[key].append(value)
+
+            # Log to MLflow if available
+            if self.mlflow_run:
+                try:
+                    import mlflow
+
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    mlflow.log_metrics(
+                        {
+                            "mae_epoch_loss": train_metrics.get("train_loss", 0),
+                            "mae_learning_rate": current_lr,
+                        },
+                        step=epoch,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log to MLflow: {e}")
 
             # Update learning rate
             if self.scheduler is not None:
@@ -1264,6 +1283,8 @@ class DINOv3Trainer(Trainer):
         config: Dict[str, Any],
         device: torch.device,
         logger_obj: Optional[Any] = None,
+
+        mlflow_run: Optional[Any] = None,
         **kwargs,
     ):
         """
@@ -1278,6 +1299,7 @@ class DINOv3Trainer(Trainer):
             config: Configuration dictionary
             device: Training device
             logger_obj: Logger instance
+            mlflow_run: MLflow run object for logging metrics
         """
         # Initialize base trainer
         super().__init__(
@@ -1306,6 +1328,7 @@ class DINOv3Trainer(Trainer):
             "warmup_teacher_temp_epochs", 30
         )
         self.log_interval = config.get("training", {}).get("log_interval", 10)
+        self.mlflow_run = mlflow_run
 
         # Setup checkpoint directory
         self.checkpoint_dir = Path(
@@ -1348,6 +1371,25 @@ class DINOv3Trainer(Trainer):
                     history[key].extend(value)
                 else:
                     history[key].append(value)
+
+            # Log to MLflow if available
+            if self.mlflow_run:
+                try:
+                    import mlflow
+
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    mlflow.log_metrics(
+                        {
+                            "dino_epoch_loss": train_metrics.get("train_loss", 0),
+                            "dino_learning_rate": current_lr,
+                            "dino_teacher_temp": train_metrics.get(
+                                "teacher_temp", self.teacher_temp
+                            ),
+                        },
+                        step=epoch,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log to MLflow: {e}")
 
             # Update learning rate
             if self.scheduler is not None:

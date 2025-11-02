@@ -167,6 +167,8 @@ def run_mae_pretraining(config: dict, device, logger, mlflow_run=None):
         criterion=None,  # MAE computes loss internally
         config=config,
         device=device,
+
+        mlflow_run=mlflow_run,
     )
 
     # Train MAE
@@ -342,6 +344,7 @@ def run_dino_pretraining(
         criterion=None,  # DINOv3 computes loss internally
         config=config,
         device=device,
+        mlflow_run=mlflow_run,
     )
 
     # Train DINOv3
