@@ -1,0 +1,110 @@
+# DINOv3 Pretraining Configuration
+# Self-distillation pretraining for Swin-UNet backbone
+# Can be used standalone or after MAE pretraining for sequential SSL
+
+experiment_name: "dinov3_pretraining"
+output_dir: "checkpoints/dinov3"
+
+# Model configuration
+model:
+  encoder: "swin_large"  # swin_large, swin_base, swin_small
+  decoder_channels: [1024, 512, 256, 128, 64]
+  num_classes: 2
+  use_attention: true
+  use_deep_supervision: false
+  dropout: 0.1
+  in_channels: 3
+
+  # DINOv3 specific parameters
+  dino:
+    out_dim: 65536  # Output dimension for DINOv3 head
+    hidden_dim: 2048  # Hidden dimension in projection head
+    bottleneck_dim: 256  # Bottleneck dimension
+    teacher_temp: 0.07  # Final teacher temperature
+    student_temp: 0.1  # Student temperature
+    momentum_teacher: 0.996  # EMA momentum for teacher
+    center_momentum: 0.9  # Momentum for centering
+
+# Data configuration
+data:
+  data_root: "data/mae_pretraining"  # Use same unlabeled data as MAE
+  tile_size: 384
+  in_channels: 3
+
+  # Multi-crop augmentation for DINOv3
+  augmentation:
+    n_global_crops: 2
+    n_local_crops: 6
+    global_crop_scale: [0.4, 1.0]
+    local_crop_scale: [0.05, 0.4]
+    global_crop_size: 384
+    local_crop_size: 192
+
+# Training configuration
+training:
+  batch_size: 32  # Per GPU batch size
+  epochs: 100
+
+  # DINOv3 specific
+  n_global_crops: 2
+  n_local_crops: 6
+  teacher_temp_schedule: true
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 30
+
+  # Optimization
+  gradient_clip_val: 3.0
+  mixed_precision: true
+  accumulation_steps: 1
+
+  # Checkpointing
+  save_frequency: 10
+  save_top_k: 3
+  monitor_metric: "val_loss"
+  mode: "min"
+
+# Optimizer configuration
+optimizer:
+  type: "adamw"
+  learning_rate: 0.0005  # Base LR, will be scaled with batch size
+  weight_decay: 0.04
+  betas: [0.9, 0.95]
+  layer_decay: 0.65  # Layer-wise LR decay for ViT/Swin
+
+# Scheduler configuration
+scheduler:
+  type: "cosine"
+  warmup_epochs: 10
+  min_lr: 1.0e-6
+  warmup_lr: 1.0e-6
+
+# System configuration
+system:
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  device: "cuda"  # cuda, mps, or cpu
+  seed: 42
+  deterministic: false
+
+# Sequential SSL configuration (optional)
+sequential_ssl:
+  enabled: false  # Set to true when training after MAE
+  mae_checkpoint: "checkpoints/mae/mae_encoder_weights.pth"
+  freeze_layers: []  # List of layer names to freeze initially
+
+# Logging configuration
+logging:
+  log_interval: 50
+  use_wandb: false
+  project_name: "swin-unet-dinov3"
+  entity: null
+  tags: ["dinov3", "ssl", "pretraining"]
+
+# Advanced options
+advanced:
+  clip_grad: true
+  ema_decay: 0.9999  # For model EMA (optional)
+  label_smoothing: 0.0

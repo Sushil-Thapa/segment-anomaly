@@ -90,6 +90,39 @@ uv run python src/train.py --config configs/config_vehicle_csam_proxy.yaml
 uv run python src/train.py --config configs/config_vehicle_csam_proxy.yaml --debug
 ```
 
+### Self-Supervised Learning (SSL) Pretraining
+
+Pretrain the encoder with MAE → DINOv3 sequential pipeline before fine-tuning:
+
+```bash
+# Full sequential SSL (MAE → DINOv3)
+uv run python src/train_sequential_ssl.py \
+    --mae_config configs/mae_pretraining_mps.yaml \
+    --dino_config configs/dinov3_pretraining_mps.yaml
+
+# Resume interrupted training
+uv run python src/train_sequential_ssl.py \
+    --mae_config configs/mae_pretraining_mps.yaml \
+    --dino_config configs/dinov3_pretraining_mps.yaml \
+    --resume checkpoints/sequential_ssl_20251101_191502
+
+# Continue training on new dataset (keeps learned weights, resets optimizer)
+uv run python src/train_sequential_ssl.py \
+    --mae_config configs/mae_pretraining_mps.yaml \
+    --dino_config configs/dinov3_pretraining_mps.yaml \
+    --continue-training checkpoints/sequential_ssl_20251101_191502
+
+# View MLflow experiments
+mlflow ui --backend-store-uri logs/mlruns
+```
+
+**Resume vs Continue-Training:**
+
+- `--resume`: Continue interrupted training (same dataset, same checkpoint dir, resumes from epoch N)
+- `--continue-training`: Start fresh training with learned weights (new dataset, new checkpoint dir, starts from epoch 0)
+
+See [SEQUENTIAL_SSL.md](docs/SEQUENTIAL_SSL.md) and [RESUME_TRAINING.md](docs/RESUME_TRAINING.md) for details.
+
 ### Dataset Format Support
 The unified dataset loader supports three formats via `dataset_format` config:
 
@@ -124,7 +157,9 @@ python tests/test_tiling.py
 
 ## Project Structure
 
-```
+## Project Structure
+
+```text
 src/
 ├── data/           # Dataset handling, transforms, and data scripts
 ├── models/         # Swin-UNet architecture
@@ -132,3 +167,7 @@ src/
 ├── losses/         # Combined loss functions
 └── utils/          # Metrics, distributed training, export
 ```
+
+````
+
+Copyright © 2025 Sushil Thapa

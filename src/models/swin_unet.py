@@ -1,6 +1,6 @@
 """
 Swin-UNet model combining Swin Transformer backbone with UNet decoder.
-Includes MAE (Masked Autoencoder) capabilities for self-supervised pretraining.
+Includes MAE (Masked Autoencoder) and DINOv3 capabilities for self-supervised pretraining.
 """
 
 import torch
@@ -9,7 +9,11 @@ import torch.nn.functional as F
 import timm
 from typing import List, Optional, Tuple, Union, Dict
 import numpy as np
+import copy
+import logging
 from .decoder import UNetDecoder, MAEDecoder, create_random_mask
+
+logger = logging.getLogger(__name__)
 
 
 class SwinUNet(nn.Module):
@@ -777,6 +781,614 @@ def create_mae_model(config: dict) -> MAESwinUNet:
     return model
 
 
+class DINOv3SwinUNet(SwinUNet):
+    """
+    Swin-UNet with DINOv3 self-distillation pretraining support.
+
+    Key features:
+    - Self-distillation via student-teacher framework
+    - Multi-crop strategy for robust feature learning
+    - Momentum teacher with EMA updates
+    - Can be initialized from MAE pretrained weights for sequential SSL
+    - Seamless transition to segmentation fine-tuning
+    """
+
+    def __init__(
+        self,
+        backbone_name: str = "swin_large_patch4_window12_384",
+        pretrained: bool = True,
+        decoder_channels: List[int] = [1024, 512, 256, 128, 64],
+        num_classes: int = 2,
+        use_attention: bool = True,
+        use_deep_supervision: bool = False,
+        dropout: float = 0.1,
+        aux_params: Optional[dict] = None,
+        in_channels: int = 3,
+        # DINOv3-specific parameters
+        dino_out_dim: int = 65536,
+        dino_hidden_dim: int = 2048,
+        dino_bottleneck_dim: int = 256,
+        dino_teacher_temp: float = 0.04,
+        dino_student_temp: float = 0.1,
+        dino_momentum_teacher: float = 0.996,
+        dino_center_momentum: float = 0.9,
+        **kwargs,
+    ):
+        """
+        Initialize DINOv3-enabled Swin-UNet.
+
+        Args:
+            All SwinUNet args plus:
+            dino_out_dim: Output dimension for DINO head
+            dino_hidden_dim: Hidden dimension in DINO projection head
+            dino_bottleneck_dim: Bottleneck dimension in DINO head
+            dino_teacher_temp: Teacher temperature for sharpening
+            dino_student_temp: Student temperature for softmax
+            dino_momentum_teacher: EMA momentum for teacher update
+            dino_center_momentum: Momentum for centering operation
+        """
+        # Initialize base SwinUNet
+        super().__init__(
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+            decoder_channels=decoder_channels,
+            num_classes=num_classes,
+            use_attention=use_attention,
+            use_deep_supervision=use_deep_supervision,
+            dropout=dropout,
+            aux_params=aux_params,
+            in_channels=in_channels,
+            **kwargs,
+        )
+
+        self.dino_teacher_temp = dino_teacher_temp
+        self.dino_student_temp = dino_student_temp
+        self.dino_momentum_teacher = dino_momentum_teacher
+        self.dino_center_momentum = dino_center_momentum
+        self.training_mode = "segmentation"  # "dino" or "segmentation"
+
+        # Get encoder output dimension
+        with torch.no_grad():
+            dummy_input = torch.randn(
+                1, in_channels, self.backbone_input_size, self.backbone_input_size
+            )
+            features = self.backbone(dummy_input)
+            encoder_dim = features[-1].shape[-1]  # NHWC format, take channel dim
+
+        # DINO projection head (student)
+        self.dino_head = DINOHead(
+            in_dim=encoder_dim,
+            out_dim=dino_out_dim,
+            hidden_dim=dino_hidden_dim,
+            bottleneck_dim=dino_bottleneck_dim,
+            use_bn=True,
+            nlayers=3,
+        )
+
+        # Teacher network (EMA of student) - create new instances instead of deepcopy
+        # Deepcopy doesn't work well with weight_norm on MPS
+        self.teacher_backbone = timm.create_model(
+            backbone_name,
+            pretrained=False,  # Don't reload pretrained, will copy weights manually
+            in_chans=in_channels,
+            num_classes=0,
+            global_pool="",
+            features_only=True,  # Match student backbone format - returns list of features
+            out_indices=(0, 1, 2, 3),  # Get all feature stages like student
+        )
+        self.teacher_head = DINOHead(
+            in_dim=encoder_dim,
+            out_dim=dino_out_dim,
+            hidden_dim=dino_hidden_dim,
+            bottleneck_dim=dino_bottleneck_dim,
+            nlayers=3,
+        )
+
+        # Copy weights from student to teacher (unless MAE checkpoint will be loaded later)
+        # This initialization will be overridden by load_mae_pretrained_encoder if called
+        self.teacher_backbone.load_state_dict(self.backbone.state_dict(), strict=False)
+        self.teacher_head.load_state_dict(self.dino_head.state_dict(), strict=False)
+
+        # Disable gradients for teacher
+        for param in self.teacher_backbone.parameters():
+            param.requires_grad = False
+        for param in self.teacher_head.parameters():
+            param.requires_grad = False
+
+        # Center for teacher output (moving average)
+        self.register_buffer("center", torch.zeros(1, dino_out_dim))
+
+        print(
+            f"Initialized DINOv3 with encoder dim: {encoder_dim}, output dim: {dino_out_dim}"
+        )
+
+    def set_training_mode(self, mode: str):
+        """
+        Set training mode between DINOv3 pretraining and segmentation fine-tuning.
+
+        Args:
+            mode: "dino" for pretraining, "segmentation" for fine-tuning
+        """
+        assert mode in ["dino", "segmentation"], f"Invalid mode: {mode}"
+        self.training_mode = mode
+
+        if mode == "dino":
+            # Enable student encoder and DINO head
+            for param in self.backbone.parameters():
+                param.requires_grad = True
+            for param in self.dino_head.parameters():
+                param.requires_grad = True
+
+            # Freeze segmentation decoder during DINO pretraining
+            for param in self.decoder.parameters():
+                param.requires_grad = False
+            if self.aux_classifier is not None:
+                for param in self.aux_classifier.parameters():
+                    param.requires_grad = False
+
+        else:  # segmentation mode
+            # Enable segmentation decoder
+            for param in self.decoder.parameters():
+                param.requires_grad = True
+            if self.aux_classifier is not None:
+                for param in self.aux_classifier.parameters():
+                    param.requires_grad = True
+
+            # Freeze DINO head during segmentation training
+            for param in self.dino_head.parameters():
+                param.requires_grad = False
+
+    @torch.no_grad()
+    def update_teacher(self):
+        """Update teacher networks using exponential moving average."""
+        for param_student, param_teacher in zip(
+            self.backbone.parameters(), self.teacher_backbone.parameters()
+        ):
+            param_teacher.data.mul_(self.dino_momentum_teacher).add_(
+                param_student.data, alpha=1 - self.dino_momentum_teacher
+            )
+
+        for param_student, param_teacher in zip(
+            self.dino_head.parameters(), self.teacher_head.parameters()
+        ):
+            param_teacher.data.mul_(self.dino_momentum_teacher).add_(
+                param_student.data, alpha=1 - self.dino_momentum_teacher
+            )
+
+    @torch.no_grad()
+    def update_center(self, teacher_output):
+        """Update center used for teacher output."""
+        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+        batch_center = batch_center / len(teacher_output)
+
+        # Update center with momentum
+        self.center = self.center * self.dino_center_momentum + batch_center * (
+            1 - self.dino_center_momentum
+        )
+
+    def forward_dino(
+        self, global_views: List[torch.Tensor], local_views: List[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for DINOv3 pretraining with multi-crop strategy.
+
+        Args:
+            global_views: List of global crop tensors (typically 2)
+            local_views: List of local crop tensors (typically 4-8)
+
+        Returns:
+            Dictionary with 'student_output', 'teacher_output', 'loss'
+        """
+        # Concatenate all views
+        if local_views is not None:
+            all_views = global_views + local_views
+        else:
+            all_views = global_views
+
+        n_global = len(global_views)
+
+        # Process all views through student
+        student_outputs = []
+        for view in all_views:
+            # Ensure correct input size
+            if view.shape[2:] != (self.backbone_input_size, self.backbone_input_size):
+                view = F.interpolate(
+                    view,
+                    size=(self.backbone_input_size, self.backbone_input_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            # Extract features
+            features = self.backbone(view)
+
+            # Global average pooling over spatial dimensions
+            if len(features[-1].shape) == 4:  # NHWC format
+                pooled = (
+                    F.adaptive_avg_pool2d(
+                        features[-1].permute(0, 3, 1, 2), 1  # NHWC -> NCHW
+                    )
+                    .squeeze(-1)
+                    .squeeze(-1)
+                )
+            elif len(features[-1].shape) == 3:  # [B, H*W, C]
+                pooled = features[-1].mean(dim=1)
+            else:  # Already [B, C]
+                pooled = features[-1]
+
+            # Project through DINO head
+            output = self.dino_head(pooled)
+            student_outputs.append(output)
+
+        # Process only global views through teacher
+        teacher_outputs = []
+        with torch.no_grad():
+            for idx, view in enumerate(global_views):
+                logger.debug(f"teacher loop {idx}: view.shape={view.shape}")
+
+                if view.shape[2:] != (
+                    self.backbone_input_size,
+                    self.backbone_input_size,
+                ):
+                    view = F.interpolate(
+                        view,
+                        size=(self.backbone_input_size, self.backbone_input_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+                features = self.teacher_backbone(view)
+                logger.debug(
+                    f"teacher loop {idx}: features[-1].shape={features[-1].shape}"
+                )
+
+                # Swin returns [B, H, W, C] - always expect 4D
+                feat = features[-1]
+                if len(feat.shape) != 4:
+                    raise RuntimeError(
+                        f"Expected 4D features [B, H, W, C], got {feat.shape}"
+                    )
+
+                # Pool: [B, H, W, C] -> [B, C, H, W] -> [B, C]
+                pooled = (
+                    F.adaptive_avg_pool2d(feat.permute(0, 3, 1, 2), 1)  # NHWC -> NCHW
+                    .squeeze(-1)
+                    .squeeze(-1)
+                )
+
+                logger.debug(f"teacher loop {idx}: pooled.shape={pooled.shape}")
+
+                output = self.teacher_head(pooled)
+                logger.debug(f"teacher loop {idx}: output.shape={output.shape}")
+                teacher_outputs.append(output)
+
+        # Concatenate outputs
+        logger.debug(
+            f"forward_dino: len(student_outputs)={len(student_outputs)}, len(teacher_outputs)={len(teacher_outputs)}"
+        )
+        for i, out in enumerate(student_outputs):
+            logger.debug(f"forward_dino: student_outputs[{i}].shape={out.shape}")
+        for i, out in enumerate(teacher_outputs):
+            logger.debug(f"forward_dino: teacher_outputs[{i}].shape={out.shape}")
+
+        student_output = torch.cat(student_outputs, dim=0)
+        teacher_output = torch.cat(teacher_outputs, dim=0)
+
+        logger.debug(
+            f"forward_dino: After concat: student={student_output.shape}, teacher={teacher_output.shape}"
+        )
+
+        # Compute loss
+        loss = self._compute_dino_loss(
+            student_output, teacher_output, n_global, len(all_views)
+        )
+
+        # Update center
+        self.update_center(teacher_output)
+
+        return {
+            "student_output": student_output,
+            "teacher_output": teacher_output,
+            "loss": loss,
+            "center": self.center.clone(),
+        }
+
+    def _compute_dino_loss(
+        self,
+        student_output: torch.Tensor,
+        teacher_output: torch.Tensor,
+        n_global: int,
+        n_total: int,
+    ) -> torch.Tensor:
+        """
+        Compute DINO loss using cross-entropy between student and teacher.
+
+        Args:
+            student_output: Student predictions for all crops [n_total * B, out_dim]
+            teacher_output: Teacher predictions for global crops [n_global * B, out_dim]
+            n_global: Number of global crops
+            n_total: Total number of crops (global + local)
+
+        Returns:
+            DINO loss value
+        """
+        # Infer batch size from concatenated outputs
+        batch_size = teacher_output.shape[0] // n_global
+
+        logger.debug(
+            f"teacher_output.shape={teacher_output.shape}, student_output.shape={student_output.shape}"
+        )
+        logger.debug(f"n_global={n_global}, n_total={n_total}, batch_size={batch_size}")
+
+        # Center and sharpen teacher output
+        teacher_output = F.softmax(
+            (teacher_output - self.center) / self.dino_teacher_temp, dim=-1
+        )
+
+        # Student output with temperature
+        student_output = F.log_softmax(student_output / self.dino_student_temp, dim=-1)
+
+        # Compute cross-entropy loss
+        # Each global view from teacher is compared with all student views except itself
+        total_loss = 0
+        n_loss_terms = 0
+
+        for t_idx in range(n_global):
+            # Teacher crop t_idx spans rows [t_idx * batch_size : (t_idx + 1) * batch_size]
+            t_start = t_idx * batch_size
+            t_end = (t_idx + 1) * batch_size
+            teacher_crop = teacher_output[t_start:t_end]  # [B, out_dim]
+
+            for s_idx in range(n_total):
+                if s_idx == t_idx:  # Skip comparing view with itself
+                    continue
+
+                # Student crop s_idx
+                s_start = s_idx * batch_size
+                s_end = (s_idx + 1) * batch_size
+                student_crop = student_output[s_start:s_end]  # [B, out_dim]
+
+                logger.debug(
+                    f"t_idx={t_idx}, s_idx={s_idx}, teacher_crop.shape={teacher_crop.shape}, student_crop.shape={student_crop.shape}"
+                )
+
+                # Cross-entropy: -sum(teacher * log_student)
+                loss = -torch.sum(teacher_crop * student_crop, dim=-1).mean()
+
+                total_loss += loss
+                n_loss_terms += 1
+
+        return total_loss / n_loss_terms if n_loss_terms > 0 else total_loss
+
+    def forward(
+        self,
+        x: Union[torch.Tensor, List[torch.Tensor]],
+        local_views: Optional[List[torch.Tensor]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]:
+        """
+        Forward pass - automatically switches between DINOv3 and segmentation modes.
+
+        Args:
+            x: Input tensor or list of global views for DINO
+            local_views: List of local views for DINO (optional)
+
+        Returns:
+            Segmentation output or DINO results
+        """
+        if self.training_mode == "dino":
+            if isinstance(x, list):
+                return self.forward_dino(x, local_views)
+            else:
+                # Single image, create pseudo multi-crop for testing
+                return self.forward_dino([x, x])
+        else:
+            # Standard segmentation forward pass
+            if isinstance(x, list):
+                x = x[0]  # Take first view if list provided
+            return super().forward(x)
+
+    def load_mae_pretrained_encoder(self, checkpoint_path: str):
+        """
+        Load MAE pretrained encoder weights before DINOv3 training.
+
+        Args:
+            checkpoint_path: Path to MAE checkpoint
+        """
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        # Handle both checkpoint formats: direct state_dict or wrapped in 'model_state_dict'
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+
+        # Extract encoder weights and fix key naming (underscore -> dot)
+        encoder_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("backbone."):
+                # Remove 'backbone.' prefix
+                new_key = key.replace("backbone.", "")
+                # Fix naming: layers_0 -> layers.0, layers_1 -> layers.1, etc.
+                new_key = new_key.replace("layers_", "layers.")
+                encoder_state_dict[new_key] = value
+
+        # Load into student encoder
+        missing_keys, unexpected_keys = self.backbone.load_state_dict(
+            encoder_state_dict, strict=False
+        )
+
+        # Load into teacher encoder (use same remapped state_dict)
+        self.teacher_backbone.load_state_dict(encoder_state_dict, strict=False)
+
+        print(f"Loaded MAE pretrained encoder from {checkpoint_path}")
+        if missing_keys:
+            print(f"Missing keys: {missing_keys[:5]}...")  # Show first 5
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
+
+
+class DINOHead(nn.Module):
+    """
+    Projection head for DINOv3.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        hidden_dim: int = 2048,
+        bottleneck_dim: int = 256,
+        nlayers: int = 3,
+        use_bn: bool = True,
+        norm_last_layer: bool = True,
+    ):
+        super().__init__()
+
+        nlayers = max(nlayers, 1)
+
+        if nlayers == 1:
+            self.mlp = nn.Linear(in_dim, bottleneck_dim)
+        else:
+            layers = [nn.Linear(in_dim, hidden_dim)]
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.GELU())
+
+            for _ in range(nlayers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if use_bn:
+                    layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.GELU())
+
+            layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+            self.mlp = nn.Sequential(*layers)
+
+        self.apply(self._init_weights)
+
+        self.last_layer = nn.utils.weight_norm(
+            nn.Linear(bottleneck_dim, out_dim, bias=False)
+        )
+        self.last_layer.weight_g.data.fill_(1)
+
+        if norm_last_layer:
+            self.last_layer.weight_g.requires_grad = False
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.mlp(x)
+        x = nn.functional.normalize(x, dim=-1, p=2)
+        x = self.last_layer(x)
+        return x
+
+
+def create_dino_model(config: dict, mae_checkpoint: str = None) -> DINOv3SwinUNet:
+    """
+    Create DINOv3-enabled Swin-UNet from configuration.
+
+    Args:
+        config: Configuration dictionary
+        mae_checkpoint: Optional path to MAE checkpoint for sequential SSL
+
+    Returns:
+        DINOv3SwinUNet model
+    """
+    model_config = config["model"]
+
+    # Get backbone name
+    backbone_name = model_config.get("backbone", "swin_large_patch4_window12_384")
+    if "encoder" in model_config:
+        encoder_map = {
+            "swin_large": "swin_large_patch4_window12_384",
+            "swin_base": "swin_base_patch4_window12_384",
+            "swin_small": "swin_small_patch4_window7_224",
+            "swin_tiny": "swin_tiny_patch4_window7_224",
+        }
+        backbone_name = encoder_map.get(model_config["encoder"], backbone_name)
+
+    # DINOv3 specific config
+    dino_config = model_config.get("dino", {})
+
+    model = DINOv3SwinUNet(
+        backbone_name=backbone_name,
+        pretrained=True,
+        decoder_channels=model_config.get(
+            "decoder_channels", [1024, 512, 256, 128, 64]
+        ),
+        num_classes=model_config.get("num_classes", 2),
+        use_attention=model_config.get("use_attention", True),
+        use_deep_supervision=model_config.get("use_deep_supervision", False),
+        dropout=model_config.get("dropout", 0.1),
+        in_channels=model_config.get("in_channels", 3),
+        # DINOv3 parameters
+        dino_out_dim=dino_config.get("out_dim", 65536),
+        dino_hidden_dim=dino_config.get("hidden_dim", 2048),
+        dino_bottleneck_dim=dino_config.get("bottleneck_dim", 256),
+        dino_teacher_temp=dino_config.get("teacher_temp", 0.04),
+        dino_student_temp=dino_config.get("student_temp", 0.1),
+        dino_momentum_teacher=dino_config.get("momentum_teacher", 0.996),
+        dino_center_momentum=dino_config.get("center_momentum", 0.9),
+    )
+
+    # Load MAE weights if provided (for sequential SSL)
+    if mae_checkpoint:
+        model.load_mae_pretrained_encoder(mae_checkpoint)
+
+    return model
+
+
+def test_dino_swin_unet():
+    """Test DINOv3-enabled Swin-UNet."""
+    # Create model
+    model = DINOv3SwinUNet(
+        backbone_name="swin_large_patch4_window12_384",
+        pretrained=False,
+        in_channels=3,
+        dino_out_dim=8192,  # Smaller for testing
+        dino_hidden_dim=1024,
+        dino_bottleneck_dim=256,
+    )
+
+    # Test input - multi-crop
+    batch_size = 2
+    global_view1 = torch.randn(batch_size, 3, 384, 384)
+    global_view2 = torch.randn(batch_size, 3, 384, 384)
+    local_view1 = torch.randn(batch_size, 3, 192, 192)
+    local_view2 = torch.randn(batch_size, 3, 192, 192)
+
+    print("Testing DINOv3 mode...")
+
+    # Test DINO mode
+    model.set_training_mode("dino")
+    dino_output = model([global_view1, global_view2], [local_view1, local_view2])
+
+    print("DINO mode output keys:", dino_output.keys())
+    print(f"DINO loss: {dino_output['loss'].item():.4f}")
+    print(f"Student output shape: {dino_output['student_output'].shape}")
+    print(f"Teacher output shape: {dino_output['teacher_output'].shape}")
+    print(f"Center shape: {dino_output['center'].shape}")
+
+    # Test teacher update
+    model.update_teacher()
+    print("Teacher updated successfully")
+
+    # Test segmentation mode
+    model.set_training_mode("segmentation")
+    seg_output = model(global_view1)
+
+    print(f"Segmentation output shape: {seg_output.shape}")
+
+    # Test model size
+    model_info = model.get_model_size()
+    print(f"Model info: {model_info}")
+
+    return True
+
+
 def test_mae_swin_unet():
     """Test MAE-enabled Swin-UNet."""
     # Create model
@@ -827,4 +1439,5 @@ def test_mae_swin_unet():
 if __name__ == "__main__":
     test_swin_unet()
     test_mae_swin_unet()
-    print("Swin-UNet tests passed!")
+    test_dino_swin_unet()
+    print("All Swin-UNet tests passed!")

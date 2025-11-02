@@ -8,7 +8,7 @@ version: "1.0.0"
 
 # Data Configuration
 data:
-  root: "/tmp/mae_test_data"
+  root: "data/vehicle_damage_csam_proxy/image/image"
   tile_size: 224  # Match Swin-Tiny input size
   in_channels: 3
   pin_memory: false  # Disable for MPS compatibility
@@ -21,9 +21,7 @@ data:
 mae:
   # Data paths for unlabeled images
   image_dirs:
-    - "sam_images"
-    - "unlabeled"
-    - "train/images"
+    - "data/vehicle_damage_csam_proxy/image/image"
 
   # Model architecture - optimized for MPS memory constraints
   backbone: "swin_tiny_patch4_window7_224"
@@ -39,8 +37,8 @@ mae:
   betas: [0.9, 0.95]
 
   # Training schedule
-  epochs: 100
-  warmup_epochs: 10
+  epochs: 2
+  warmup_epochs: 0
   min_lr: 1.0e-6
 
   # Scheduler
@@ -56,7 +54,7 @@ mae:
 
   # For debugging/testing
   debug_mode: false
-  debug_sample_ratio: 0.001
+  debug_sample_ratio: 1.0
 
 # Model Configuration
 model:
@@ -77,13 +75,13 @@ training:
   grad_clip_norm: 1.0
   accumulate_grad_batches: 1
 
-  log_interval: 10
+  log_interval: 500
   save_interval: 5
   eval_interval: 10
 
   early_stopping:
-    enabled: false
-    patience: 20
+    enabled: true
+    patience: 3
     min_delta: 1e-4
 
   ddp: false
@@ -127,8 +125,8 @@ logging:
 # Debugging Configuration
 debug:
   enabled: false
-  sample_ratio: 0.01
-  max_images: 100
+  sample_ratio: 1.0
+  max_images: null
   fast_dev_run: false
 
 # Hardware Optimization for MPS

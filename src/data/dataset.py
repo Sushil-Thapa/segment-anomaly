@@ -1308,6 +1308,211 @@ def test_mae_dataset():
         return True
 
 
+class DINOv3PretrainingDataset(MAEPretrainingDataset):
+    """
+    Dataset for DINOv3 pretraining with multi-crop augmentation.
+    Extends MAEPretrainingDataset with multi-crop strategy.
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        image_dirs: List[str] = None,
+        tile_size: int = 384,
+        transform: Optional[Callable] = None,
+        cache_tiles: bool = False,
+        max_images: Optional[int] = None,
+        extensions: List[str] = [".jpg", ".jpeg", ".png", ".tiff", ".tif"],
+        in_channels: int = 3,
+        debug_mode: bool = False,
+        debug_sample_ratio: float = 0.001,
+        # DINOv3 multi-crop parameters
+        n_global_crops: int = 2,
+        n_local_crops: int = 6,
+        global_crop_size: int = 384,
+        local_crop_size: int = 192,
+        global_crop_scale: Tuple[float, float] = (0.4, 1.0),
+        local_crop_scale: Tuple[float, float] = (0.05, 0.4),
+        **kwargs,
+    ):
+        """
+        Initialize DINOv3 pretraining dataset.
+
+        Args:
+            All MAEPretrainingDataset args plus:
+            n_global_crops: Number of global crops
+            n_local_crops: Number of local crops
+            global_crop_size: Size of global crops
+            local_crop_size: Size of local crops
+            global_crop_scale: Scale range for global crops
+            local_crop_scale: Scale range for local crops
+        """
+        # Initialize base dataset
+        super().__init__(
+            data_root=data_root,
+            image_dirs=image_dirs,
+            tile_size=tile_size,
+            transform=None,  # Will set custom transform
+            cache_tiles=cache_tiles,
+            max_images=max_images,
+            extensions=extensions,
+            in_channels=in_channels,
+            debug_mode=debug_mode,
+            debug_sample_ratio=debug_sample_ratio,
+            **kwargs,
+        )
+
+        # DINOv3 specific parameters
+        self.n_global_crops = n_global_crops
+        self.n_local_crops = n_local_crops
+        self.global_crop_size = global_crop_size
+        self.local_crop_size = local_crop_size
+
+        # Set up multi-crop transform
+        if transform is None:
+            from .transforms import get_dino_multicrop_transform
+
+            self.transform = get_dino_multicrop_transform(
+                global_crop_size=global_crop_size,
+                local_crop_size=local_crop_size,
+                global_crop_scale=global_crop_scale,
+                local_crop_scale=local_crop_scale,
+                n_global_crops=n_global_crops,
+                n_local_crops=n_local_crops,
+                in_channels=in_channels,
+            )
+        else:
+            self.transform = transform
+
+        print(
+            f"DINOv3 dataset initialized with {n_global_crops} global crops + {n_local_crops} local crops"
+        )
+
+    def __getitem__(self, idx: int) -> Dict[str, any]:
+        """
+        Get a sample with multi-crop augmentation for DINOv3.
+
+        Args:
+            idx: Sample index
+
+        Returns:
+            Dictionary with 'global_views', 'local_views', and 'image' keys
+        """
+        # Load image (reuse parent logic)
+        image_path = self.image_paths[idx]
+
+        try:
+            # Load image
+            image = cv2.imread(str(image_path))
+            if image is None:
+                raise ValueError(f"Could not load image: {image_path}")
+
+            # Convert to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Handle grayscale conversion if needed
+            if self.in_channels == 1:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                image = np.expand_dims(image, axis=-1)
+
+            # Resize to base size (will be cropped by multi-crop transform)
+            if image.shape[:2] != (self.tile_size, self.tile_size):
+                image = cv2.resize(
+                    image,
+                    (self.tile_size, self.tile_size),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+            # Apply multi-crop transform
+            if self.transform:
+                sample = self.transform(image)
+            else:
+                # Fallback: create dummy multi-crop
+                import torch
+
+                if image.dtype != np.uint8:
+                    image = (image * 255).astype(np.uint8)
+
+                image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+
+                sample = {
+                    "global_views": [image_tensor] * self.n_global_crops,
+                    "local_views": [image_tensor] * self.n_local_crops,
+                    "image": image_tensor,
+                }
+
+            return sample
+
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            # Return dummy sample
+            import torch
+
+            dummy = torch.zeros(self.in_channels, self.tile_size, self.tile_size)
+            return {
+                "global_views": [dummy] * self.n_global_crops,
+                "local_views": [dummy] * self.n_local_crops,
+                "image": dummy,
+            }
+
+
+def create_dino_dataset(
+    config: dict, debug_mode: bool = False
+) -> DINOv3PretrainingDataset:
+    """
+    Create DINOv3 dataset from configuration.
+
+    Args:
+        config: Configuration dictionary
+        debug_mode: Enable debug mode for testing
+
+    Returns:
+        DINOv3PretrainingDataset instance
+    """
+    data_config = config.get("data", {})
+    aug_config = data_config.get("augmentation", {})
+
+    # Get data root (reuse MAE data)
+    data_root = data_config.get("data_root", "data/mae_pretraining")
+    if not os.path.exists(data_root):
+        # Try alternative locations
+        alternative_roots = [
+            "data/unlabeled",
+            "data/train",
+            "data",
+        ]
+
+        for alt_root in alternative_roots:
+            if os.path.exists(alt_root):
+                data_root = alt_root
+                break
+        else:
+            raise ValueError(
+                f"DINOv3 data root not found. Tried: {[data_root] + alternative_roots}"
+            )
+
+    # Create dataset
+    dataset = DINOv3PretrainingDataset(
+        data_root=data_root,
+        image_dirs=data_config.get("image_dirs", None),
+        tile_size=data_config.get("tile_size", 384),
+        max_images=data_config.get("max_images", None),
+        in_channels=config.get("model", {}).get("in_channels", 3),
+        debug_mode=debug_mode,
+        debug_sample_ratio=data_config.get("debug_sample_ratio", 0.001),
+        cache_tiles=data_config.get("cache_tiles", False),
+        # Multi-crop parameters
+        n_global_crops=aug_config.get("n_global_crops", 2),
+        n_local_crops=aug_config.get("n_local_crops", 6),
+        global_crop_size=aug_config.get("global_crop_size", 384),
+        local_crop_size=aug_config.get("local_crop_size", 192),
+        global_crop_scale=tuple(aug_config.get("global_crop_scale", [0.4, 1.0])),
+        local_crop_scale=tuple(aug_config.get("local_crop_scale", [0.05, 0.4])),
+    )
+
+    return dataset
+
+
 if __name__ == "__main__":
     test_dataset()
     test_mae_dataset()

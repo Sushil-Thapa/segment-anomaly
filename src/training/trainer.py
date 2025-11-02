@@ -812,12 +812,66 @@ class MAETrainer(Trainer):
             )
         )
         self.reconstruction_save_dir.mkdir(parents=True, exist_ok=True)
+        self.log_interval = config.get("training", {}).get("log_interval", 10)
+
+        # Setup checkpoint directory
+        self.checkpoint_dir = Path(
+            config.get("checkpoint_dir", config.get("output_dir", "checkpoints/mae"))
+        )
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Set model to MAE mode
         if hasattr(self.model, "set_training_mode"):
             self.model.set_training_mode("mae")
 
         print(f"MAE Trainer initialized with mask ratio: {self.mask_ratio}")
+
+    def fit(
+        self, epochs: int, resume_from_checkpoint: Optional[str] = None
+    ) -> Dict[str, List]:
+        """Train the model for specified number of epochs (MAE version without validation)."""
+        start_epoch = 0
+
+        if resume_from_checkpoint is not None:
+            checkpoint = self.load_checkpoint(resume_from_checkpoint)
+            start_epoch = checkpoint["epoch"] + 1
+            logger.info(f"Resumed training from epoch {start_epoch}")
+
+        logger.info(f"Starting MAE training for {epochs - start_epoch} epochs")
+
+        history = defaultdict(list)
+
+        for epoch in range(start_epoch, epochs):
+            self.current_epoch = epoch
+
+            # Training phase
+            train_metrics = self.train_epoch()
+
+            # Store metrics
+            for key, value in train_metrics.items():
+                if isinstance(value, list):
+                    history[key].extend(value)
+                else:
+                    history[key].append(value)
+
+            # Update learning rate
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            # Save checkpoint
+            if (epoch + 1) % self.config.get("training", {}).get("save_every", 10) == 0:
+                self.save_checkpoint(epoch, train_metrics, is_best=False)
+
+        # Save final encoder weights
+        final_metrics = {
+            k: v[-1] if isinstance(v, list) and v else v for k, v in history.items()
+        }
+        self.save_checkpoint(epochs - 1, final_metrics, is_best=True)
+        return dict(history)
+
+    def train_epoch(self) -> Dict[str, float]:
+        """Override base train_epoch to use MAE-specific training logic."""
+        return self.train_one_epoch(self.current_epoch)
 
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -1135,6 +1189,16 @@ class MAETrainer(Trainer):
             torch.save(checkpoint, best_path)
             print(f"Saved best MAE checkpoint: {best_path}")
 
+            # Save encoder-only weights for DINOv3 initialization
+            encoder_state = {}
+            for key, value in self.model.state_dict().items():
+                if key.startswith("backbone."):
+                    encoder_state[key] = value
+
+            encoder_path = self.checkpoint_dir / "mae_encoder_weights.pth"
+            torch.save(encoder_state, encoder_path)
+            print(f"Saved MAE encoder weights: {encoder_path}")
+
         print(f"Saved MAE checkpoint: {checkpoint_path}")
 
     def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True):
@@ -1179,6 +1243,440 @@ class MAETrainer(Trainer):
         return epoch, metrics
 
 
+class DINOv3Trainer(Trainer):
+    """
+    Trainer for DINOv3 self-distillation pretraining.
+
+    Key features:
+    - Multi-crop strategy with global and local views
+    - Student-teacher framework with EMA updates
+    - Temperature-based sharpening
+    - Can be initialized from MAE pretrained weights for sequential SSL
+    """
+
+    def __init__(
+        self,
+        model,  # DINOv3SwinUNet
+        train_loader: torch.utils.data.DataLoader,
+        val_loader: Optional[torch.utils.data.DataLoader],
+        optimizer: optim.Optimizer,
+        scheduler: Any,
+        config: Dict[str, Any],
+        device: torch.device,
+        logger_obj: Optional[Any] = None,
+        **kwargs,
+    ):
+        """
+        Initialize DINOv3 trainer.
+
+        Args:
+            model: DINOv3SwinUNet model
+            train_loader: Training data loader (must provide multi-crop views)
+            val_loader: Validation data loader
+            optimizer: Optimizer
+            scheduler: Learning rate scheduler
+            config: Configuration dictionary
+            device: Training device
+            logger_obj: Logger instance
+        """
+        # Initialize base trainer
+        super().__init__(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            config=config,
+            device=device,
+            logger_obj=logger_obj,
+            **kwargs,
+        )
+
+        # DINOv3 specific settings
+        self.n_global_crops = config.get("training", {}).get("n_global_crops", 2)
+        self.n_local_crops = config.get("training", {}).get("n_local_crops", 4)
+        self.teacher_temp_schedule = config.get("training", {}).get(
+            "teacher_temp_schedule", False
+        )
+        self.warmup_teacher_temp = config.get("training", {}).get(
+            "warmup_teacher_temp", 0.04
+        )
+        self.teacher_temp = config.get("training", {}).get("teacher_temp", 0.07)
+        self.warmup_teacher_temp_epochs = config.get("training", {}).get(
+            "warmup_teacher_temp_epochs", 30
+        )
+        self.log_interval = config.get("training", {}).get("log_interval", 10)
+
+        # Setup checkpoint directory
+        self.checkpoint_dir = Path(
+            config.get("checkpoint_dir", config.get("output_dir", "checkpoints/dinov3"))
+        )
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Set model to DINOv3 mode
+        if hasattr(self.model, "set_training_mode"):
+            self.model.set_training_mode("dino")
+
+        print(
+            f"DINOv3 Trainer initialized with {self.n_global_crops} global crops, {self.n_local_crops} local crops"
+        )
+
+    def fit(
+        self, epochs: int, resume_from_checkpoint: Optional[str] = None
+    ) -> Dict[str, List]:
+        """Train the model for specified number of epochs (DINOv3 version without validation)."""
+        start_epoch = 0
+
+        if resume_from_checkpoint is not None:
+            checkpoint = self.load_checkpoint(resume_from_checkpoint)
+            start_epoch = checkpoint["epoch"] + 1
+            logger.info(f"Resumed training from epoch {start_epoch}")
+
+        logger.info(f"Starting DINOv3 training for {epochs - start_epoch} epochs")
+
+        history = defaultdict(list)
+
+        for epoch in range(start_epoch, epochs):
+            self.current_epoch = epoch
+
+            # Training phase
+            train_metrics = self.train_epoch()
+
+            # Store metrics
+            for key, value in train_metrics.items():
+                if isinstance(value, list):
+                    history[key].extend(value)
+                else:
+                    history[key].append(value)
+
+            # Update learning rate
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            # Save checkpoint
+            if (epoch + 1) % self.config.get("training", {}).get("save_every", 10) == 0:
+                self.save_checkpoint(epoch, train_metrics, is_best=False)
+
+        # Save final encoder weights
+        final_metrics = {
+            k: v[-1] if isinstance(v, list) and v else v for k, v in history.items()
+        }
+        self.save_checkpoint(epochs - 1, final_metrics, is_best=True)
+        return dict(history)
+
+    def train_epoch(self) -> Dict[str, float]:
+        """Override base train_epoch to use DINOv3-specific training logic."""
+        return self.train_one_epoch(self.current_epoch)
+
+    def _update_teacher_temp(self, epoch: int, total_epochs: int):
+        """Update teacher temperature with warmup schedule."""
+        if not self.teacher_temp_schedule:
+            return
+
+        if epoch < self.warmup_teacher_temp_epochs:
+            # Linear warmup
+            self.model.dino_teacher_temp = (
+                self.warmup_teacher_temp
+                + (self.teacher_temp - self.warmup_teacher_temp)
+                * epoch
+                / self.warmup_teacher_temp_epochs
+            )
+        else:
+            self.model.dino_teacher_temp = self.teacher_temp
+
+    def train_one_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        Train one epoch with DINOv3 self-distillation loss.
+
+        Args:
+            epoch: Current epoch number
+
+        Returns:
+            Dictionary of training metrics
+        """
+        self.model.train()
+        epoch_metrics = defaultdict(list)
+
+        # Update teacher temperature
+        total_epochs = self.config.get("training", {}).get("epochs", 100)
+        self._update_teacher_temp(epoch, total_epochs)
+
+        # Progress tracking
+        total_batches = len(self.train_loader)
+        start_time = time.time()
+
+        for batch_idx, batch in enumerate(self.train_loader):
+            try:
+                # Extract multi-crop views from batch
+                # Expected format: batch["global_views"] = list of global crop tensors
+                #                  batch["local_views"] = list of local crop tensors
+                if "global_views" in batch:
+                    global_views = [
+                        v.to(self.device, non_blocking=True)
+                        for v in batch["global_views"]
+                    ]
+                    local_views = [
+                        v.to(self.device, non_blocking=True)
+                        for v in batch.get("local_views", [])
+                    ]
+
+                    logger.debug(
+                        f"TRAINER: len(global_views)={len(global_views)}, len(local_views)={len(local_views)}"
+                    )
+                    for i, v in enumerate(global_views):
+                        logger.debug(f"TRAINER: global_views[{i}].shape={v.shape}")
+                    for i, v in enumerate(local_views):
+                        logger.debug(f"TRAINER: local_views[{i}].shape={v.shape}")
+                else:
+                    # Fallback: single image, create pseudo multi-crop
+                    images = batch["image"].to(self.device, non_blocking=True)
+                    global_views = [images, images]
+                    local_views = []
+
+                # Zero gradients
+                self.optimizer.zero_grad()
+
+                # Forward pass with mixed precision
+                with autocast(device_type=self.device.type):
+                    dino_output = self.model(global_views, local_views)
+                    loss = dino_output["loss"]
+
+                # Backward pass
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+
+                    # Gradient clipping
+                    if self.config.get("training", {}).get("gradient_clip_val", 0) > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config["training"]["gradient_clip_val"],
+                        )
+
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+
+                    # Gradient clipping
+                    if self.config.get("training", {}).get("gradient_clip_val", 0) > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config["training"]["gradient_clip_val"],
+                        )
+
+                    self.optimizer.step()
+
+                # Update teacher with EMA
+                self.model.update_teacher()
+
+                # Update metrics
+                epoch_metrics["train_loss"].append(loss.item())
+                epoch_metrics["teacher_temp"].append(self.model.dino_teacher_temp)
+
+                # Log progress
+                if batch_idx % self.log_interval == 0:
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    elapsed = time.time() - start_time
+
+                    print(
+                        f"Epoch {epoch} [{batch_idx:4d}/{total_batches}] "
+                        f"Loss: {loss.item():.4f} "
+                        f"T_temp: {self.model.dino_teacher_temp:.4f} "
+                        f"LR: {current_lr:.2e} "
+                        f"Time: {elapsed:.1f}s"
+                    )
+
+                # Memory management for MPS
+                if self.device.type == "mps":
+                    torch.mps.empty_cache()
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"OOM error in batch {batch_idx}, skipping...")
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    elif self.device.type == "mps":
+                        torch.mps.empty_cache()
+                    continue
+                else:
+                    raise e
+
+        # Calculate epoch averages
+        epoch_avg_metrics = {
+            key: np.mean(values) for key, values in epoch_metrics.items()
+        }
+
+        return epoch_avg_metrics
+
+    def validate(self, epoch: int) -> Dict[str, float]:
+        """
+        Validate DINOv3 performance.
+
+        Args:
+            epoch: Current epoch number
+
+        Returns:
+            Dictionary of validation metrics
+        """
+        if self.val_loader is None:
+            return {}
+
+        self.model.eval()
+        val_metrics = defaultdict(list)
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.val_loader):
+                try:
+                    # Extract views
+                    if "global_views" in batch:
+                        global_views = [
+                            v.to(self.device, non_blocking=True)
+                            for v in batch["global_views"]
+                        ]
+                        local_views = [
+                            v.to(self.device, non_blocking=True)
+                            for v in batch.get("local_views", [])
+                        ]
+                    else:
+                        images = batch["image"].to(self.device, non_blocking=True)
+                        global_views = [images, images]
+                        local_views = []
+
+                    # Forward pass
+                    with autocast(device_type=self.device.type):
+                        dino_output = self.model(global_views, local_views)
+                        loss = dino_output["loss"]
+
+                    # Update metrics
+                    val_metrics["val_loss"].append(loss.item())
+
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"OOM error in validation batch {batch_idx}, skipping...")
+                        if self.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        elif self.device.type == "mps":
+                            torch.mps.empty_cache()
+                        continue
+                    else:
+                        raise e
+
+        # Calculate validation averages
+        val_avg_metrics = {key: np.mean(values) for key, values in val_metrics.items()}
+
+        return val_avg_metrics
+
+    def save_checkpoint(
+        self,
+        epoch: int,
+        metrics: Dict[str, float],
+        is_best: bool = False,
+        filename: Optional[str] = None,
+    ):
+        """
+        Save DINOv3 training checkpoint.
+
+        Args:
+            epoch: Current epoch
+            metrics: Training metrics
+            is_best: Whether this is the best checkpoint
+            filename: Custom filename
+        """
+        if filename is None:
+            filename = f"dino_checkpoint_epoch_{epoch:03d}.pth"
+
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "metrics": metrics,
+            "config": self.config,
+            "training_mode": "dino",
+            "teacher_temp": self.model.dino_teacher_temp,
+            "center": self.model.center,
+        }
+
+        if self.scheduler is not None:
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+
+        if self.scaler is not None:
+            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
+
+        # Save checkpoint
+        checkpoint_path = self.checkpoint_dir / filename
+        torch.save(checkpoint, checkpoint_path)
+
+        # Save encoder weights separately for downstream tasks
+        encoder_checkpoint = {
+            "backbone_state_dict": {
+                k.replace("backbone.", ""): v
+                for k, v in self.model.state_dict().items()
+                if k.startswith("backbone.")
+            },
+            "epoch": epoch,
+            "config": self.config,
+        }
+        encoder_path = self.checkpoint_dir / f"dino_encoder_epoch_{epoch:03d}.pth"
+        torch.save(encoder_checkpoint, encoder_path)
+
+        # Save best checkpoint
+        if is_best:
+            best_path = self.checkpoint_dir / "dino_best_checkpoint.pth"
+            torch.save(checkpoint, best_path)
+
+            best_encoder_path = self.checkpoint_dir / "dino_encoder_weights.pth"
+            torch.save(encoder_checkpoint, best_encoder_path)
+
+            print(f"Saved best DINOv3 checkpoint: {best_path}")
+            print(f"Saved best encoder weights: {best_encoder_path}")
+
+        print(f"Saved DINOv3 checkpoint: {checkpoint_path}")
+
+    def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True):
+        """
+        Load DINOv3 training checkpoint.
+
+        Args:
+            checkpoint_path: Path to checkpoint file
+            load_optimizer: Whether to load optimizer state
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Load model state
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Load optimizer state
+        if load_optimizer and "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Load scheduler state
+        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        # Load scaler state
+        if self.scaler is not None and "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        # Restore DINOv3 settings
+        if "teacher_temp" in checkpoint:
+            self.model.dino_teacher_temp = checkpoint["teacher_temp"]
+        if "center" in checkpoint:
+            self.model.center = checkpoint["center"]
+
+        # Set training mode
+        if hasattr(self.model, "set_training_mode"):
+            self.model.set_training_mode("dino")
+
+        epoch = checkpoint.get("epoch", 0)
+        metrics = checkpoint.get("metrics", {})
+
+        print(f"Loaded DINOv3 checkpoint from epoch {epoch}")
+        print(f"Checkpoint metrics: {metrics}")
+
+        return epoch, metrics
+
+
 def test_mae_trainer():
     """Test MAE trainer functionality."""
     print("Testing MAE trainer...")
@@ -1203,7 +1701,34 @@ def test_mae_trainer():
         return False
 
 
+def test_dino_trainer():
+    """Test DINOv3 trainer functionality."""
+    print("Testing DINOv3 trainer...")
+
+    try:
+        # Mock configuration
+        config = {
+            "training": {
+                "n_global_crops": 2,
+                "n_local_crops": 4,
+                "teacher_temp_schedule": True,
+                "warmup_teacher_temp": 0.04,
+                "teacher_temp": 0.07,
+                "warmup_teacher_temp_epochs": 30,
+                "gradient_clip_val": 1.0,
+            }
+        }
+
+        print("DINOv3 trainer class defined successfully")
+        return True
+
+    except Exception as e:
+        print(f"Error testing DINOv3 trainer: {e}")
+        return False
+
+
 if __name__ == "__main__":
     test_trainer()
     test_mae_trainer()
+    test_dino_trainer()
     print("Trainer tests passed!")

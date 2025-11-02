@@ -1,0 +1,132 @@
+# DINOv3 Pretraining Configuration for Apple Silicon (MPS)
+# Optimized for M1/M2/M3 Macs with memory constraints
+
+experiment_name: "dinov3_pretraining_mps"
+output_dir: "checkpoints/dinov3_mps"
+
+# Model configuration
+model:
+  encoder: "swin_tiny"  # Must match MAE backbone for sequential SSL
+  decoder_channels: [768, 384, 192, 96, 48]
+  num_classes: 2
+  use_attention: true
+  use_deep_supervision: false
+  dropout: 0.1
+  in_channels: 3
+
+  # DINOv3 specific parameters (reduced for MPS)
+  dino:
+    out_dim: 8192  # Smaller output dim for memory efficiency
+    hidden_dim: 1024
+    bottleneck_dim: 256
+    teacher_temp: 0.07
+    student_temp: 0.1
+    momentum_teacher: 0.996
+    center_momentum: 0.9
+
+# Data configuration
+data:
+  data_root: "data/vehicle_damage_csam_proxy/image/image"
+  tile_size: 384
+  in_channels: 3
+
+  # Reduced multi-crop for memory constraints
+  augmentation:
+    n_global_crops: 2
+    n_local_crops: 4  # Reduced from 6
+    global_crop_scale: [0.4, 1.0]
+    local_crop_scale: [0.05, 0.4]
+    global_crop_size: 384
+    local_crop_size: 192
+
+# Training configuration
+training:
+  batch_size: 8  # Reduced for MPS memory constraints
+  epochs: 2
+
+  # DINOv3 specific
+  n_global_crops: 2
+  n_local_crops: 4
+  teacher_temp_schedule: true
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0
+
+  # Optimization
+  gradient_clip_val: 3.0
+  mixed_precision: true  # MPS supports AMP
+  accumulation_steps: 4  # Simulate larger batch size
+
+  # Checkpointing
+  save_frequency: 10
+  save_top_k: 3
+  monitor_metric: "train_loss"
+  mode: "min"
+
+# Callbacks configuration
+callbacks:
+  early_stopping:
+    enabled: true
+    patience: 3
+    mode: "min"
+    monitor: "train_loss"
+  checkpoint:
+    enabled: true
+    save_top_k: 3
+    monitor: "train_loss"
+    mode: "min"
+  visualization:
+    enabled: false
+    num_samples: 4
+    save_frequency: 5
+    save_every_n_epochs: 1
+
+# Optimizer configuration
+optimizer:
+  type: "adamw"
+  learning_rate: 0.0002  # Adjusted for smaller effective batch size
+  weight_decay: 0.04
+  betas: [0.9, 0.95]
+  layer_decay: 0.65
+
+# Scheduler configuration
+scheduler:
+  type: "cosine"
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+  warmup_lr: 1.0e-6
+
+# System configuration - MPS optimized
+system:
+  num_workers: 0  # Set to 0 to avoid pickling issues with nested closures in DINO transforms
+  pin_memory: false  # Not needed for MPS
+  persistent_workers: false  # Must be false when num_workers=0
+  prefetch_factor: 2
+  device: "mps"
+  seed: 42
+  deterministic: false
+
+# Sequential SSL configuration
+sequential_ssl:
+  enabled: false
+  mae_checkpoint: "checkpoints/mae_mps/mae_encoder_weights.pth"
+  freeze_layers: []
+
+# Logging configuration
+logging:
+  log_interval: 100  # Log every 100 batches instead of 20
+  use_wandb: false
+  project_name: "swin-unet-dinov3-mps"
+  entity: null
+  tags: ["dinov3", "ssl", "pretraining", "mps"]
+
+# Advanced options
+advanced:
+  clip_grad: true
+  ema_decay: 0.9999
+  label_smoothing: 0.0
+
+# MPS-specific memory management
+mps:
+  empty_cache_frequency: 10  # Clear cache every N batches
+  max_memory_allocated: 12  # GB (approximate)
