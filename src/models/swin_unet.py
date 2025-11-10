@@ -746,14 +746,17 @@ def create_mae_model(config: dict) -> MAESwinUNet:
         MAESwinUNet model
     """
     model_config = config["model"]
+    mae_section = config.get("mae", {})
 
-    # Get backbone name
-    backbone_name = model_config.get("backbone", "swin_large_patch4_window12_384")
+    # Get backbone name - check mae section first, then model section
+    backbone_name = mae_section.get("backbone") or model_config.get("backbone", "swin_large_patch4_window12_384")
+    
     if "encoder" in model_config:
         encoder_map = {
             "swin_large": "swin_large_patch4_window12_384",
             "swin_base": "swin_base_patch4_window12_384",
             "swin_small": "swin_small_patch4_window7_224",
+            "swin_tiny": "swin_tiny_patch4_window7_224",
         }
         backbone_name = encoder_map.get(model_config["encoder"], backbone_name)
 
@@ -771,11 +774,11 @@ def create_mae_model(config: dict) -> MAESwinUNet:
         use_deep_supervision=model_config.get("use_deep_supervision", False),
         dropout=model_config.get("dropout", 0.1),
         in_channels=model_config.get("in_channels", 3),
-        # MAE parameters
-        mae_decoder_dim=mae_config.get("decoder_dim", 512),
-        mae_decoder_depth=mae_config.get("decoder_depth", 8),
-        mae_decoder_heads=mae_config.get("decoder_heads", 16),
-        mae_mask_ratio=mae_config.get("mask_ratio", 0.75),
+        # MAE parameters - check mae section first, then nested model.mae
+        mae_decoder_dim=mae_section.get("decoder_dim") or mae_config.get("decoder_dim", 512),
+        mae_decoder_depth=mae_section.get("decoder_depth") or mae_config.get("decoder_depth", 8),
+        mae_decoder_heads=mae_section.get("decoder_heads") or mae_config.get("decoder_heads", 16),
+        mae_mask_ratio=mae_section.get("mask_ratio") or mae_config.get("mask_ratio", 0.75),
     )
 
     return model

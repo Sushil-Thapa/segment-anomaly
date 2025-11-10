@@ -1,0 +1,231 @@
+# MAE Pretraining Configuration - CUDA Optimized
+# Self-supervised pretraining using Masked Autoencoder for NVIDIA GPUs
+
+# Experiment Info
+experiment_name: "mae_pretraining_swin_base_cuda"
+description: "CUDA-optimized MAE pretraining using Swin-Base for NVIDIA RTX 4090"
+version: "1.0.0"
+
+# Data Configuration
+data:
+  # Update this path to your image folder (e.g., "data/my_images" or "D:/datasets/images")
+  # The script will recursively find all .jpg and .png files in all subdirectories
+  root: "data/RAW"
+  tile_size: 192  # Reduced from 224 to save memory
+  in_channels: 1  # GRAYSCALE images
+  pin_memory: true  # Enable for CUDA
+
+  dataset:
+    force_grayscale: false  # Already grayscale
+    grayscale_method: "luminance"
+  
+  # MAE-specific data config (nested under data.mae)
+  mae:
+    data_root: "data/RAW"
+    # Data paths for unlabeled images (supports multiple directories)
+    # If not specified, will search in common subdirectories (images/, image/, train/, etc.)
+    # Leave as null to auto-discover, or specify exact paths
+    image_dirs: null  # null = auto-discover recursively from data.root
+    # Or specify exact subdirectories:
+    # image_dirs:
+    #   - "subfolder1"
+    #   - "subfolder2"
+    tile_size: 192    # Reduced from 224 to save memory
+    max_images: null  # Use all images
+    cache_tiles: false
+    debug_sample_ratio: 0.001
+
+# Model Configuration
+model:
+  encoder: "swin_small"  # Swin-Small for better capacity
+  decoder_channels: [768, 384, 192, 96, 48]  # Adjusted for Swin-Small
+  num_classes: 2
+  use_attention: true
+  use_deep_supervision: false
+  dropout: 0.1
+  in_channels: 1  # GRAYSCALE images
+
+# MAE Pretraining Configuration
+mae:
+  # Model architecture - Swin-Small
+  backbone: "swin_small_patch4_window7_224"  # Swin-Small for better capacity
+  decoder_dim: 384      # Increased from 256 for Swin-Small
+  decoder_depth: 6      # Increased from 4
+  decoder_heads: 12     # Increased from 8
+
+  # Training parameters
+  mask_ratio: 0.75      # 75% of patches masked
+  batch_size: 8         # Reduced to 8 for Swin-Small memory requirements
+  learning_rate: 1.0e-4 # Increased from 5.3e-5 for faster convergence
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+
+  # Training schedule
+  epochs: 2            # Quick pretraining for 2 epochs
+  warmup_epochs: 1      # Reduced from 10
+  min_lr: 1.0e-6
+
+  # Scheduler
+  use_scheduler: true
+  scheduler_type: "cosine"
+
+  # Data loading
+  max_images: null      # Use all 36773 images
+  num_workers: 24        # Increased for better data pipeline
+  prefetch_factor: 2    # Increased for better throughput
+
+  # Mixed precision training
+  use_amp: true         # Automatic Mixed Precision for speed
+  grad_clip: 1.0        # Gradient clipping
+
+# Training Configuration
+training:
+  use_amp: true         # Enable AMP for CUDA
+  grad_clip_norm: 1.0
+  accumulate_grad_batches: 8  # Accumulate 8 batches = effective batch size of 64
+  
+  log_interval: 2000
+  save_every: 1         # Save checkpoint every epoch (matches trainer code)
+  eval_interval: 5
+  
+  early_stopping:
+    enabled: true       # Enable early stopping
+    patience: 3         # Stop if no improvement for 3 epochs
+    min_delta: 1e-4
+  
+  ddp: false
+
+# Logging Configuration
+logging:
+  log_dir: "logs"
+  log_interval: 2000      # Log every 2000 batches
+  save_interval: 1      # Save checkpoint every 1 epoch
+  log_images: true
+  log_reconstructions: true
+  num_log_images: 8
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  tensorboard:
+    enabled: false
+  
+  wandb:
+    enabled: false
+
+# Checkpointing
+checkpoint:
+  save_dir: "checkpoints/mae_cuda"
+  save_best: true
+  save_last: true
+  save_interval: 1     # Every 10 epochs
+
+# Device Configuration
+device:
+  use_cuda: true
+  cuda_device: 0        # GPU 0
+  deterministic: false  # Set true for reproducibility (slower)
+  benchmark: true       # cudnn.benchmark for speed
+
+# System Configuration
+system:
+  device: "cuda"
+  num_workers: 8        # Parallel data loading for CUDA
+  seed: 42
+  pin_memory: true      # Enable for CUDA
+
+# Reproducibility
+seed: 42
+deterministic: false
+
+# Performance
+compile: false          # PyTorch 2.0 compile (experimental)
+channels_last: true     # Memory format optimization
+
+# Data Augmentation for MAE
+augmentation:
+  # Basic augmentations for pretraining
+  random_resized_crop:
+    scale: [0.2, 1.0]
+    ratio: [0.75, 1.33]
+  
+  color_jitter:
+    brightness: 0.4
+    contrast: 0.4
+    saturation: 0.4
+    hue: 0.1
+  
+  random_horizontal_flip: true
+  random_grayscale: 0.2
+  
+  # Normalization (ImageNet stats)
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+# Validation
+validation:
+  enabled: false        # MAE is unsupervised, no validation needed
+  interval: 10
+
+# MLflow tracking
+mlflow:
+  enabled: true
+  experiment_name: "mae_pretraining_cuda"
+  tracking_uri: "logs/mlruns"
+
+# Callbacks Configuration
+callbacks:
+  early_stopping:
+    monitor: "train_loss"
+    patience: 20
+    mode: "min"
+  model_checkpoint:
+    filename: "mae_cuda_epoch_{epoch:03d}"
+    monitor: "train_loss"
+    mode: "min"
+    save_top_k: 3
+  lr_monitor:
+    logging_interval: "step"
+
+# Output Configuration
+output_dir: "./outputs/mae_pretraining_cuda"
+checkpoint_dir: "./outputs/mae_pretraining_cuda/checkpoints"
+log_dir: "./outputs/mae_pretraining_cuda/logs"
+
+# Debugging Configuration
+debug:
+  enabled: false
+  sample_ratio: 1.0
+  max_images: null
+  fast_dev_run: false
+
+# Hardware Optimization for CUDA
+optimization:
+  max_split_size_mb: 512   # Larger for CUDA with more memory
+  empty_cache_interval: 100  # Less frequent for CUDA
+  benchmark: true          # Enable for CUDA
+  deterministic: false
+
+# Resume Configuration
+resume:
+  checkpoint_path: null
+  load_optimizer: true
+  load_scheduler: true
+
+# Validation Configuration (override above)
+validation:
+  enabled: false
+  split_ratio: 0.1
+  data_root: null
+
+# Production Configuration
+production:
+  save_encoder_only: true
+  export_onnx: false
+  export_torchscript: false
+
+# Next Stage Configuration
+next_stage:
+  segmentation_config: "./configs/config_vehicle_csam_proxy.yaml"
+  load_mae_encoder: true
+  freeze_encoder_epochs: 5

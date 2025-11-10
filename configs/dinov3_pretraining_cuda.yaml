@@ -1,0 +1,186 @@
+# DINOv3 Pretraining Configuration - CUDA Optimized
+# Optimized for NVIDIA RTX 4090 with full performance
+
+experiment_name: "dinov3_pretraining_cuda"
+output_dir: "checkpoints/dinov3_cuda"
+
+# Model configuration
+model:
+  encoder: "swin_small"  # Must match MAE backbone for sequential SSL
+  decoder_channels: [768, 384, 192, 96, 48]  # Adjusted for Swin-Small
+  num_classes: 2
+  use_attention: true
+  use_deep_supervision: false
+  dropout: 0.1
+  in_channels: 1  # GRAYSCALE images
+
+  # DINOv3 specific parameters (optimized for Swin-Small)
+  dino:
+    out_dim: 16384      # Increased from 8192 for Swin-Small
+    hidden_dim: 1536    # Increased from 1024
+    bottleneck_dim: 192 # Increased from 128
+    teacher_temp: 0.07
+    student_temp: 0.1
+    momentum_teacher: 0.996
+    center_momentum: 0.9
+
+# Data configuration
+data:
+  # Update this to your image folder path (same as MAE config)
+  # Will recursively find all .jpg and .png files
+  data_root: "data/RAW"
+  tile_size: 192        # Match MAE tile size for memory efficiency
+  in_channels: 1        # GRAYSCALE images
+
+  # Multi-crop augmentation for DINOv3
+  augmentation:
+    n_global_crops: 2    # 2 global views
+    n_local_crops: 4     # Reduced from 6 to save memory
+    global_crop_scale: [0.4, 1.0]
+    local_crop_scale: [0.05, 0.4]
+    global_crop_size: 192  # Match tile_size
+    local_crop_size: 96    # Half of global for memory
+
+# Training configuration
+# Training configuration
+training:
+  batch_size: 4         # Lower for DINOv3 multi-crop
+  epochs: 5            # Quick pretraining for 2 epochs
+  accumulate_grad_batches: 8  # Effective batch size of 32
+  log_interval: 50      # Log every 50 batches
+  save_every: 1         # Save checkpoint every epoch (matches trainer code)
+  eval_interval: 5
+  use_amp: true         # Enable AMP for CUDA
+  grad_clip_norm: 3.0
+  
+  early_stopping:
+    enabled: true       # Enable early stopping
+    patience: 3         # Stop if no improvement for 5 epochs
+    min_delta: 1e-4
+  
+  ddp: false
+
+  # DINOv3 specific
+  n_global_crops: 2
+  n_local_crops: 4      # Match data.augmentation.n_local_crops
+
+  # Optimizer
+  optimizer:
+    type: "adamw"
+    lr: 5.0e-4          # Increased from 3.5e-4 for faster convergence
+    weight_decay: 0.04
+    betas: [0.9, 0.999]
+
+  # Learning rate schedule
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 2    # Reduced from 10
+    min_lr: 1.0e-6
+
+  # Data loading
+  num_workers: 8        # Increased for better throughput
+  pin_memory: true
+  prefetch_factor: 4    # Increased for better data pipeline
+
+# Device configuration
+device:
+  use_cuda: true
+  cuda_device: 0
+  deterministic: false
+  benchmark: true
+
+# System Configuration
+system:
+  device: "cuda"
+  num_workers: 4        # Match training.num_workers
+  seed: 42
+  pin_memory: true
+
+# Checkpointing
+checkpoint:
+  save_dir: "checkpoints/dinov3_cuda"
+  save_interval: 10
+  save_best: true
+  save_last: true
+
+# Logging
+logging:
+  log_dir: "logs"
+  log_interval: 50
+  save_interval: 10
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  tensorboard:
+    enabled: false
+  
+  wandb:
+    enabled: false
+  
+# MLflow tracking
+mlflow:
+  enabled: true
+  experiment_name: "dinov3_pretraining_cuda"
+  tracking_uri: "logs/mlruns"
+
+# Callbacks Configuration
+callbacks:
+  early_stopping:
+    monitor: "train_loss"
+    patience: 20
+    mode: "min"
+  model_checkpoint:
+    filename: "dino_cuda_epoch_{epoch:03d}"
+    monitor: "train_loss"
+    mode: "min"
+    save_top_k: 3
+  lr_monitor:
+    logging_interval: "step"
+
+# Output Configuration
+output_dir: "./outputs/dinov3_pretraining_cuda"
+checkpoint_dir: "./outputs/dinov3_pretraining_cuda/checkpoints"
+log_dir: "./outputs/dinov3_pretraining_cuda/logs"
+
+# Debugging Configuration
+debug:
+  enabled: false
+  sample_ratio: 1.0
+  max_images: null
+  fast_dev_run: false
+
+# Hardware Optimization for CUDA
+optimization:
+  max_split_size_mb: 512
+  empty_cache_interval: 100
+  benchmark: true
+  deterministic: false
+
+# Resume Configuration
+resume:
+  checkpoint_path: null
+  load_optimizer: true
+  load_scheduler: true
+
+# Validation Configuration
+validation:
+  enabled: false
+  split_ratio: 0.1
+  data_root: null
+
+# Reproducibility
+seed: 42
+
+# Performance optimizations
+compile: false          # PyTorch 2.0 compile
+channels_last: true     # Memory layout optimization
+
+# Teacher update schedule
+teacher:
+  momentum_schedule:
+    base: 0.996
+    final: 1.0
+  temp_schedule:
+    warmup_epochs: 30
+    base: 0.04
+    final: 0.07
