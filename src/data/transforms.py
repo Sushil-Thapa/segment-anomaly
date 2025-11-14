@@ -1116,92 +1116,102 @@ def get_mae_transform(tile_size: int = 384, in_channels: int = 3) -> Callable:
     return A.Compose(transforms)
 
 
-def get_dino_multicrop_transform(
-    global_crop_size: int = 384,
-    local_crop_size: int = 192,
-    global_crop_scale: Tuple[float, float] = (0.4, 1.0),
-    local_crop_scale: Tuple[float, float] = (0.05, 0.4),
-    n_global_crops: int = 2,
-    n_local_crops: int = 6,
-    in_channels: int = 3,
-) -> Callable:
+class DINOMultiCropTransform:
     """
-    Create multi-crop augmentation for DINOv3 pretraining.
-
-    Args:
-        global_crop_size: Size of global crops
-        local_crop_size: Size of local crops
-        global_crop_scale: Scale range for global crops
-        local_crop_scale: Scale range for local crops
-        n_global_crops: Number of global crops to generate
-        n_local_crops: Number of local crops to generate
-        in_channels: Number of input channels
-
-    Returns:
-        Callable that takes an image and returns dict with global and local crops
+    Multi-crop augmentation for DINOv3 pretraining.
+    Picklable class for multiprocessing DataLoader workers.
     """
 
-    # Global crop augmentation pipeline
-    global_transform = A.Compose(
-        [
-            A.RandomResizedCrop(
-                size=(global_crop_size, global_crop_size),
-                scale=global_crop_scale,
-                ratio=(0.75, 1.33),
-                interpolation=cv2.INTER_LINEAR,
-            ),
-            A.HorizontalFlip(p=0.5),
-            A.OneOf(
-                [
-                    A.ColorJitter(
-                        brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=1.0
-                    ),
-                    A.ToGray(p=1.0),
-                ],
-                p=0.8,
-            ),
-            A.GaussianBlur(blur_limit=(3, 7), sigma_limit=(0.1, 2.0), p=1.0),
-            A.Normalize(
-                mean=[0.485, 0.456, 0.406] if in_channels == 3 else [0.5],
-                std=[0.229, 0.224, 0.225] if in_channels == 3 else [0.5],
-                max_pixel_value=255.0,
-            ),
-            ToTensorV2(),
-        ]
-    )
+    def __init__(
+        self,
+        global_crop_size: int = 384,
+        local_crop_size: int = 192,
+        global_crop_scale: Tuple[float, float] = (0.4, 1.0),
+        local_crop_scale: Tuple[float, float] = (0.05, 0.4),
+        n_global_crops: int = 2,
+        n_local_crops: int = 6,
+        in_channels: int = 3,
+    ):
+        """
+        Args:
+            global_crop_size: Size of global crops
+            local_crop_size: Size of local crops
+            global_crop_scale: Scale range for global crops
+            local_crop_scale: Scale range for local crops
+            n_global_crops: Number of global crops to generate
+            n_local_crops: Number of local crops to generate
+            in_channels: Number of input channels
+        """
+        self.n_global_crops = n_global_crops
+        self.n_local_crops = n_local_crops
+        self.in_channels = in_channels
 
-    # Local crop augmentation pipeline (more aggressive)
-    local_transform = A.Compose(
-        [
-            A.RandomResizedCrop(
-                size=(local_crop_size, local_crop_size),
-                scale=local_crop_scale,
-                ratio=(0.75, 1.33),
-                interpolation=cv2.INTER_LINEAR,
-            ),
-            A.HorizontalFlip(p=0.5),
-            A.OneOf(
-                [
-                    A.ColorJitter(
-                        brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=1.0
-                    ),
-                    A.ToGray(p=1.0),
-                ],
-                p=0.8,
-            ),
-            A.GaussianBlur(blur_limit=(3, 7), sigma_limit=(0.1, 2.0), p=0.5),
-            A.Solarize(threshold=128, p=0.2),
-            A.Normalize(
-                mean=[0.485, 0.456, 0.406] if in_channels == 3 else [0.5],
-                std=[0.229, 0.224, 0.225] if in_channels == 3 else [0.5],
-                max_pixel_value=255.0,
-            ),
-            ToTensorV2(),
-        ]
-    )
+        # Global crop augmentation pipeline
+        self.global_transform = A.Compose(
+            [
+                A.RandomResizedCrop(
+                    size=(global_crop_size, global_crop_size),
+                    scale=global_crop_scale,
+                    ratio=(0.75, 1.33),
+                    interpolation=cv2.INTER_LINEAR,
+                ),
+                A.HorizontalFlip(p=0.5),
+                A.OneOf(
+                    [
+                        A.ColorJitter(
+                            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=1.0
+                        ),
+                        A.ToGray(p=1.0),
+                    ],
+                    p=0.8,
+                ),
+                A.GaussianBlur(blur_limit=(3, 7), sigma_limit=(0.1, 2.0), p=1.0),
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406] if in_channels == 3 else [0.5],
+                    std=[0.229, 0.224, 0.225] if in_channels == 3 else [0.5],
+                    max_pixel_value=255.0,
+                ),
+                ToTensorV2(),
+            ]
+        )
 
-    def transform_fn(image):
+        # Local crop augmentation pipeline (more aggressive)
+        self.local_transform = A.Compose(
+            [
+                A.RandomResizedCrop(
+                    size=(local_crop_size, local_crop_size),
+                    scale=local_crop_scale,
+                    ratio=(0.75, 1.33),
+                    interpolation=cv2.INTER_LINEAR,
+                ),
+                A.HorizontalFlip(p=0.5),
+                A.OneOf(
+                    [
+                        A.ColorJitter(
+                            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=1.0
+                        ),
+                        A.ToGray(p=1.0),
+                    ],
+                    p=0.8,
+                ),
+                A.GaussianBlur(blur_limit=(3, 7), sigma_limit=(0.1, 2.0), p=0.5),
+                A.Solarize(threshold=128, p=0.2),
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406] if in_channels == 3 else [0.5],
+                    std=[0.229, 0.224, 0.225] if in_channels == 3 else [0.5],
+                    max_pixel_value=255.0,
+                ),
+                ToTensorV2(),
+            ]
+        )
+
+    def __call__(self, image):
         """Apply multi-crop augmentation to image."""
+        import warnings
+        
+        # Suppress albumentations grayscale warning for already-gray images
+        warnings.filterwarnings("ignore", message="The image is already gray")
+        
         # Ensure image is numpy array
         if isinstance(image, torch.Tensor):
             image = image.cpu().numpy()
@@ -1216,22 +1226,22 @@ def get_dino_multicrop_transform(
                 image = image.astype(np.uint8)
 
         # Handle grayscale
-        if in_channels == 1 and image.ndim == 3 and image.shape[2] == 3:
+        if self.in_channels == 1 and image.ndim == 3 and image.shape[2] == 3:
             image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
             image = np.expand_dims(image, axis=-1)
-        elif in_channels == 3 and image.ndim == 2:
+        elif self.in_channels == 3 and image.ndim == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
         # Generate global crops
         global_crops = []
-        for _ in range(n_global_crops):
-            crop = global_transform(image=image)["image"]
+        for _ in range(self.n_global_crops):
+            crop = self.global_transform(image=image)["image"]
             global_crops.append(crop)
 
         # Generate local crops
         local_crops = []
-        for _ in range(n_local_crops):
-            crop = local_transform(image=image)["image"]
+        for _ in range(self.n_local_crops):
+            crop = self.local_transform(image=image)["image"]
             local_crops.append(crop)
 
         return {
@@ -1240,7 +1250,40 @@ def get_dino_multicrop_transform(
             "image": global_crops[0],  # For compatibility
         }
 
-    return transform_fn
+
+def get_dino_multicrop_transform(
+    global_crop_size: int = 384,
+    local_crop_size: int = 192,
+    global_crop_scale: Tuple[float, float] = (0.4, 1.0),
+    local_crop_scale: Tuple[float, float] = (0.05, 0.4),
+    n_global_crops: int = 2,
+    n_local_crops: int = 6,
+    in_channels: int = 3,
+) -> DINOMultiCropTransform:
+    """
+    Create multi-crop augmentation for DINOv3 pretraining.
+
+    Args:
+        global_crop_size: Size of global crops
+        local_crop_size: Size of local crops
+        global_crop_scale: Scale range for global crops
+        local_crop_scale: Scale range for local crops
+        n_global_crops: Number of global crops to generate
+        n_local_crops: Number of local crops to generate
+        in_channels: Number of input channels
+
+    Returns:
+        DINOMultiCropTransform instance (picklable for multiprocessing)
+    """
+    return DINOMultiCropTransform(
+        global_crop_size=global_crop_size,
+        local_crop_size=local_crop_size,
+        global_crop_scale=global_crop_scale,
+        local_crop_scale=local_crop_scale,
+        n_global_crops=n_global_crops,
+        n_local_crops=n_local_crops,
+        in_channels=in_channels,
+    )
 
 
 if __name__ == "__main__":

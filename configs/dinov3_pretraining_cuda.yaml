@@ -31,6 +31,8 @@ data:
   data_root: "data/RAW"
   tile_size: 192        # Match MAE tile size for memory efficiency
   in_channels: 1        # GRAYSCALE images
+  max_images: null      # Use all images (no limit)
+  debug_sample_ratio: 1.0  # Use 100% of dataset (not 0.1%!)
 
   # Multi-crop augmentation for DINOv3
   augmentation:
@@ -42,20 +44,19 @@ data:
     local_crop_size: 96    # Half of global for memory
 
 # Training configuration
-# Training configuration
 training:
-  batch_size: 4         # Lower for DINOv3 multi-crop
-  epochs: 5            # Quick pretraining for 2 epochs
-  accumulate_grad_batches: 8  # Effective batch size of 32
-  log_interval: 50      # Log every 50 batches
-  save_every: 1         # Save checkpoint every epoch (matches trainer code)
+  batch_size: 48        # Increased from 16 (28% VRAM, safe to increase)
+  epochs: 20           # 20 epochs for full dataset
+  accumulate_grad_batches: 1  # No accumulation needed with batch_size=32
+  log_interval: 50     # Log every 50 batches
+  save_every: 5         # Save checkpoint every epoch
   eval_interval: 5
   use_amp: true         # Enable AMP for CUDA
   grad_clip_norm: 3.0
   
   early_stopping:
     enabled: true       # Enable early stopping
-    patience: 3         # Stop if no improvement for 5 epochs
+    patience: 3         # Stop if no improvement for 3 epochs
     min_delta: 1e-4
   
   ddp: false
@@ -74,13 +75,14 @@ training:
   # Learning rate schedule
   lr_scheduler:
     type: "cosine"
-    warmup_epochs: 2    # Reduced from 10
+    warmup_epochs: 5     # 25% of total epochs for warmup
     min_lr: 1.0e-6
 
-  # Data loading
-  num_workers: 8        # Increased for better throughput
+  # Data loading - maximized for high GPU utilization
+  num_workers: 24       # Increased to match CPU cores
   pin_memory: true
-  prefetch_factor: 4    # Increased for better data pipeline
+  prefetch_factor: 12   # Increased for aggressive pre-loading
+  persistent_workers: true  # Reuse workers between epochs
 
 # Device configuration
 device:
@@ -92,7 +94,7 @@ device:
 # System Configuration
 system:
   device: "cuda"
-  num_workers: 4        # Match training.num_workers
+  num_workers: 24       # Match training.num_workers
   seed: 42
   pin_memory: true
 
@@ -106,7 +108,7 @@ checkpoint:
 # Logging
 logging:
   log_dir: "logs"
-  log_interval: 50
+  log_interval: 500
   save_interval: 10
   level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

@@ -27,6 +27,32 @@ from src.training.trainer import MAETrainer, DINOv3Trainer
 import torch.optim as optim
 
 
+def dino_collate_fn(batch):
+    """
+    Collate function for DINOv3 multi-crop batches (module-level for pickle compatibility).
+    
+    Each sample returns {'global_views': [crop1, crop2], 'local_views': [crop1, ..., cropN]}
+    We need to stack each crop type across the batch.
+    """
+    global_views = []
+    local_views = []
+
+    # Get number of crops from first sample
+    n_global = len(batch[0]["global_views"])
+    n_local = len(batch[0]["local_views"])
+
+    # Stack each crop type across batch dimension
+    for crop_idx in range(n_global):
+        crops = torch.stack([sample["global_views"][crop_idx] for sample in batch])
+        global_views.append(crops)
+
+    for crop_idx in range(n_local):
+        crops = torch.stack([sample["local_views"][crop_idx] for sample in batch])
+        local_views.append(crops)
+
+    return {"global_views": global_views, "local_views": local_views}
+
+
 def setup_logging(output_dir: Path, debug: bool = False):
     """Setup logging configuration."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -235,31 +261,7 @@ def run_dino_pretraining(
     batch_size = config.get("training", {}).get("batch_size", 32)
     num_workers = config.get("system", {}).get("num_workers", 4)
 
-    # Custom collate function for DINOv3 multi-crop batches
-    def dino_collate_fn(batch):
-        """
-        Collate function that properly handles lists of crops from DINOv3 dataset.
-        Each sample returns {'global_views': [crop1, crop2], 'local_views': [crop1, ..., cropN]}
-        We need to stack each crop type across the batch.
-        """
-        global_views = []
-        local_views = []
-
-        # Get number of crops from first sample
-        n_global = len(batch[0]["global_views"])
-        n_local = len(batch[0]["local_views"])
-
-        # Stack each crop type across batch dimension
-        for crop_idx in range(n_global):
-            crops = torch.stack([sample["global_views"][crop_idx] for sample in batch])
-            global_views.append(crops)
-
-        for crop_idx in range(n_local):
-            crops = torch.stack([sample["local_views"][crop_idx] for sample in batch])
-            local_views.append(crops)
-
-        return {"global_views": global_views, "local_views": local_views}
-
+    # Use module-level dino_collate_fn for pickle compatibility
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -380,7 +382,7 @@ def run_dino_pretraining(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sequential SSL: MAE → DINOv3 Pretraining"
+        description="Sequential SSL: MAE -> DINOv3 Pretraining"
     )
     parser.add_argument(
         "--mae_config", type=str, required=True, help="Path to MAE config file"
@@ -477,7 +479,7 @@ def main():
 
     logger.info("=" * 80)
     logger.info("SEQUENTIAL SELF-SUPERVISED LEARNING")
-    logger.info("MAE → DINOv3 → Segmentation Fine-tuning")
+    logger.info("MAE -> DINOv3 -> Segmentation Fine-tuning")
     logger.info("=" * 80)
     logger.info(f"MAE config: {args.mae_config}")
     logger.info(f"DINOv3 config: {args.dino_config}")
@@ -509,7 +511,7 @@ def main():
             # Log overall pipeline parameters
             mlflow.log_params(
                 {
-                    "pipeline": "MAE → DINOv3",
+                    "pipeline": "MAE -> DINOv3",
                     "mae_config_file": args.mae_config,
                     "dino_config_file": args.dino_config,
                     "debug_mode": args.debug,
