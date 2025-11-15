@@ -34,23 +34,63 @@ def dino_collate_fn(batch):
     Each sample returns {'global_views': [crop1, crop2], 'local_views': [crop1, ..., cropN]}
     We need to stack each crop type across the batch.
     """
-    global_views = []
-    local_views = []
+    """
+    Robust collate for DINOv3 multi-crop batches.
 
-    # Get number of crops from first sample
-    n_global = len(batch[0]["global_views"])
-    n_local = len(batch[0]["local_views"])
+    Ensures each crop index is resized to a common (H, W) before stacking so
+    that workers don't crash when a sample returns crops of differing sizes
+    (occasionally happens when transforms use different interpolation or
+    tile boundaries).
+    """
 
-    # Stack each crop type across batch dimension
-    for crop_idx in range(n_global):
-        crops = torch.stack([sample["global_views"][crop_idx] for sample in batch])
-        global_views.append(crops)
+    import torch.nn.functional as F
 
-    for crop_idx in range(n_local):
-        crops = torch.stack([sample["local_views"][crop_idx] for sample in batch])
-        local_views.append(crops)
+    if len(batch) == 0:
+        return {"global_views": [], "local_views": []}
 
-    return {"global_views": global_views, "local_views": local_views}
+    # Helper to stack views for a given view accessor (global/local)
+    def _stack_views(get_view, n_views):
+        stacked_views = []
+        for vi in range(n_views):
+            views = [get_view(sample, vi) for sample in batch]
+
+            # All views are tensors with shape [C, H, W]
+            # Find target size (max H and max W across the batch)
+            sizes = [v.shape[-2:] for v in views]
+            target_h = max(s[0] for s in sizes)
+            target_w = max(s[1] for s in sizes)
+
+            resized = []
+            for v in views:
+                if (v.shape[-2], v.shape[-1]) != (target_h, target_w):
+                    # interpolate expects a batched tensor
+                    v = F.interpolate(
+                        v.unsqueeze(0), size=(target_h, target_w), mode="bilinear", align_corners=False
+                    ).squeeze(0)
+                resized.append(v)
+
+            # Stack into tensor [batch, C, H, W]
+            stacked = torch.stack(resized)
+            stacked_views.append(stacked)
+
+        return stacked_views
+
+    # Determine counts from first sample (safe because dataset ensures consistent view counts)
+    n_global = len(batch[0].get("global_views", []))
+    n_local = len(batch[0].get("local_views", []))
+
+    global_views = _stack_views(lambda s, i: s["global_views"][i], n_global) if n_global > 0 else []
+    local_views = _stack_views(lambda s, i: s["local_views"][i], n_local) if n_local > 0 else []
+
+    # Preserve any other fields (paths/ids) as lists
+    other = {}
+    for k in batch[0].keys():
+        if k not in ("global_views", "local_views"):
+            other[k] = [sample.get(k) for sample in batch]
+
+    out = {"global_views": global_views, "local_views": local_views}
+    out.update(other)
+    return out
 
 
 def setup_logging(output_dir: Path, debug: bool = False):
